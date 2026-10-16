@@ -1213,7 +1213,13 @@ onBeforeUnmount(() => {
               :title="withShortcut('toggle fullscreen', 'toggle-fullscreen')"
               aria-label="Toggle terminal fullscreen"
               @click="toggleFullscreen"
-            ><span aria-hidden="true">⛶</span></button>
+            >
+              <svg
+                class="app__term-icon"
+                viewBox="0 0 16 16"
+                aria-hidden="true"
+              ><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" /></svg>
+            </button>
             <button
               v-if="filesAvailable"
               class="app__term-btn"
@@ -1437,6 +1443,17 @@ onBeforeUnmount(() => {
   cursor: default;
   border-color: var(--th-border);
   color: var(--th-text-lo);
+}
+/* Drawn rather than a ⛶ glyph, which many Linux fonts lack. */
+.app__term-icon {
+  display: block;
+  width: 1em;
+  height: 1em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .app__term-fontsize {
   font-size: 0.72rem;
