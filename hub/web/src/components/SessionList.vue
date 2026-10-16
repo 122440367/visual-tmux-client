@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import type { Session } from '../api'
 import { askConfirm } from '../dialogs'
 import { shortcutFor } from '../desktop'
@@ -102,8 +102,13 @@ function togglePin(name: string): void {
 const dragName = ref<string | null>(null)
 const dragOverName = ref<string | null>(null)
 
+// `v-focus="true"` also selects the input's text, so typing replaces it. The
+// selection waits a tick: v-model fills the value in its own mounted hook.
 const vFocus = {
-  mounted: (el: HTMLElement) => el.focus(),
+  mounted: (el: HTMLInputElement, binding: { value?: boolean }) => {
+    el.focus()
+    if (binding.value) void nextTick(() => el.select())
+  },
 }
 
 function onDragStart(name: string, ev: DragEvent): void {
@@ -414,7 +419,7 @@ defineExpose({
       >
         <div v-if="renaming === s.name" class="session-list__rename" @click.stop>
           <input
-            v-focus
+            v-focus="desktop"
             v-model="renameDraft"
             type="text"
             class="session-list__input"
