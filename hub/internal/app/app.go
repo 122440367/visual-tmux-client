@@ -69,6 +69,12 @@ type Options struct {
 	Socket      string
 	ProcessFact terminal.ProcessFactory
 	Backend     session.Backend
+	// Wrap, when set, receives the hub's router and returns the handler the
+	// server actually runs. It is how an embedding host -- the desktop shell --
+	// mounts its own routes beside the hub's without the hub knowing about them.
+	// Whatever it returns owns every request, so it must hand the ones it does
+	// not recognise to the router it was given.
+	Wrap func(http.Handler) http.Handler
 }
 
 // New constructs the application composition root.
@@ -132,6 +138,9 @@ func New(cfg *config.Config, prov config.Provenance, staticFS fs.FS, opt ...Opti
 	routerCfg := newRouterConfig(cfg, staticFS)
 
 	router := thttp.NewRouter(routerCfg, sessionService, fileService, ticketStore, wsHandler)
+	if opts.Wrap != nil {
+		router = opts.Wrap(router)
+	}
 
 	httpServer := &http.Server{
 		Addr:              cfg.Server.Addr,

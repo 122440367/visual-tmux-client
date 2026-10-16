@@ -256,3 +256,53 @@ func TestAppStart_ListenError(t *testing.T) {
 		t.Fatal("expected Start to fail when port already in use")
 	}
 }
+
+// An embedding host mounts its own routes through Wrap; requests it does not
+// claim must still reach the hub's router.
+func TestWrapMountsRoutesBesideTheRouter(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Server.Addr = "127.0.0.1:0"
+
+	wrap := func(next http.Handler) http.Handler {
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /host/ping", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTeapot)
+		})
+		mux.Handle("/", next)
+		return mux
+	}
+
+	app, err := New(&cfg, config.Provenance{}, nil, Options{
+		Backend:     &dummyBackend{},
+		ProcessFact: &dummyFactory{},
+		Wrap:        wrap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := app.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+		defer shutdownCancel()
+		_ = app.Shutdown(shutdownCtx) //nolint:errcheck // test cleanup
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	for path, want := range map[string]int{
+		"/host/ping":         http.StatusTeapot,
+		"/api/client-config": http.StatusOK,
+	} {
+		resp, err := client.Get("http://" + app.Addr() + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_ = resp.Body.Close() //nolint:errcheck // test cleanup
+		if resp.StatusCode != want {
+			t.Errorf("GET %s: expected %d, got %d", path, want, resp.StatusCode)
+		}
+	}
+}
