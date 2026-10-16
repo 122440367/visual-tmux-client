@@ -31,6 +31,7 @@ Tests use isolated sockets and target only their own server during cleanup.
 - Browse, preview, edit, and organize files on the host from the terminal: directory tree, multi-tab editor, Markdown and image preview, and a context menu for create/rename/delete/download.
 - Insert a file's path into the terminal input line without leaving the manager.
 - Built-in Chinese tmux guide available from the in-app help button.
+- A native desktop application for macOS and Linux with a menu bar, platform keyboard shortcuts, right-click menus, native save dialogs, drag-and-drop paths, and no sign-in (see [Desktop application](#desktop-application)).
 - Session names accept non-ASCII text such as Chinese (up to 64 characters); `:`, `.`, `/`, `\`, `;`, full-width lookalikes (`：`, `．`, `；`), edge whitespace, and control characters are reserved/disallowed.
 - Preserve terminal state across browser disconnects by leaving tmux sessions running.
 - Use bearer-token authentication and short-lived, single-use WebSocket tickets.
@@ -71,6 +72,35 @@ Or pass a custom YAML configuration file:
 ```
 
 Run `./visual-tmux-client --help` to see all flags and environment variables.
+
+## Desktop application
+
+Visual Tmux Client is also available as a native desktop application for macOS and Linux. It runs the same hub inside the application, on loopback, and shows the same interface in a native window — every feature of the browser client is there, with the parts a desktop application is expected to have:
+
+- **No sign-in.** Each launch starts a private hub with a fresh token and hands it to the window; there is nothing to copy or paste, and nothing is listening beyond `127.0.0.1`.
+- **A native menu bar** with File, Edit, View, Session and Help menus, and keyboard shortcuts that never take a key from the terminal: on macOS they all use ⌘, on Linux they add Shift to Ctrl the way GNOME Terminal does (so `Ctrl+C`, `Ctrl+W` and `Ctrl+T` still reach the shell).
+- **Right-click menus** on sessions (open, rename, pin, reorder, kill) and in the terminal (copy, paste, select all, clear scrollback, files, close). When tmux's mouse mode is on, a right click belongs to tmux; Shift+right-click opens the application's menu.
+- **Native dialogs and files:** confirmations and prompts are in-app dialogs, downloads go through the system save dialog (into Downloads by default), copy and paste use the system clipboard, and links open in your browser.
+- **Drag and drop** files from Finder or your file manager onto the window to type their quoted paths into the terminal, as a terminal application does.
+- **Window behaviour:** a resizable sidebar, the window's size remembered between launches, native fullscreen, the session name in the title bar, one window per user (launching again brings it forward), and a warning before quitting with unsaved file edits. Quitting never stops your tmux sessions.
+
+| Action | macOS | Linux |
+| --- | --- | --- |
+| New session | ⌘T | Ctrl+Shift+T |
+| Close panel | ⌘W | Ctrl+Shift+W |
+| Rename session | F2 | F2 |
+| Next / previous session | ⌥⌘→ / ⌥⌘← | Ctrl+Shift+↓ / Ctrl+Shift+↑ |
+| Go to session 1–9 | ⌘1 … ⌘9 | Alt+1 … Alt+9 |
+| Copy / paste | ⌘C / ⌘V | Ctrl+Shift+C / Ctrl+Shift+V |
+| Clear scrollback | ⌘K | Ctrl+Shift+K |
+| Toggle sidebar / files | ⌘B / ⇧⌘E | Ctrl+Shift+B / Ctrl+Shift+E |
+| Font size bigger / smaller / reset | ⌘= / ⌘- / ⌘0 | Ctrl+= / Ctrl+- / Ctrl+0 |
+| Full screen | ⌃⌘F | F11 |
+| tmux guide | ⌘? | F1 |
+
+Download `visual-tmux-client-desktop_<version>_darwin_universal.zip` (macOS) or `visual-tmux-client-desktop_<version>_linux_amd64.tar.gz` (Linux) from the Releases page. The macOS build is not notarized; after moving the app to Applications, clear the quarantine flag once with `xattr -dr com.apple.quarantine "/Applications/Visual Tmux Client.app"`. On Linux the binary needs GTK 3 and WebKitGTK 4.1 (`libwebkit2gtk-4.1-0` on Debian and Ubuntu); copy `visual-tmux-client.desktop` to `~/.local/share/applications/` and the icon to `~/.local/share/icons/` to add it to your launcher.
+
+The desktop application reads the same YAML configuration as the server, from `visual-tmux-client.yaml` in its configuration directory — `~/Library/Application Support/visual-tmux-client/` on macOS, `~/.config/visual-tmux-client/` on Linux (File → Open Configuration Folder) — or from `--config <path>`. The server's listen address and token settings do not apply: the desktop hub always listens on loopback with a per-launch token. When started from the Dock or a launcher, it adds the usual package-manager directories (Homebrew, MacPorts, Nix, `~/.local/bin`) to `PATH` so `tmux` is found, and supplies a UTF-8 locale if none is set so tmux displays non-ASCII text; `tmux.path` in the configuration overrides the lookup.
 
 ## Configuration
 
@@ -228,13 +258,23 @@ make package    # Build release tarballs under release/
 make clean      # Remove generated build output and caches
 ```
 
+The desktop application is a separate Go module, `hub/desktop`, built with [Wails](https://wails.io) v2. It needs a C toolchain and, on Linux, the GTK 3 and WebKitGTK development packages (`libgtk-3-dev libwebkit2gtk-4.1-dev` on Debian and Ubuntu); the server build above needs neither.
+
+```sh
+make install-wails   # Install the pinned Wails CLI
+make desktop         # Package the app under hub/desktop/build/bin (.app on macOS)
+make desktop-dev     # Plain go build of the desktop binary, no packaging
+make desktop-test    # Desktop module tests and go vet
+make desktop-lint    # golangci-lint for the desktop module
+```
+
 To create multiple archives locally, pass space-separated Go targets:
 
 ```sh
 TARGETS="darwin/arm64 darwin/amd64 linux/arm64 linux/amd64" make package
 ```
 
-Pushing a `v*` tag runs the GitHub Actions release workflow, builds those four targets, creates checksums, and publishes a GitHub Release.
+Pushing a `v*` tag runs the GitHub Actions release workflow, builds those four targets plus the Linux (amd64) and macOS (universal) desktop applications, creates checksums, and publishes a GitHub Release.
 
 ## Architecture
 
@@ -251,6 +291,8 @@ hub/internal/terminal/       Terminal backpressure buffer, ring staging, attachm
 hub/internal/transport/http/ REST API routing, DTO mapping, bearer middleware, SPA static handler
 hub/internal/transport/ws/   WebSocket handshake, origin validation, framing, peer adapter
 hub/web/                     Vue 3 frontend (Vite + TypeScript + xterm.js)
+hub/desktop/                 Desktop application (separate Go module, Wails v2): window, menu, native bridge
+hub/desktop/internal/        Embedded hub launch, page↔window bridge routes, shortcuts, window state, environment
 configs/                     Example configuration templates
 ```
 

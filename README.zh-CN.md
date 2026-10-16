@@ -29,6 +29,7 @@ VTC 创建或连接会话时，会在所连接的 tmux 服务上设置全局默�
 - 在终端内浏览、预览、编辑与整理主机文件：目录树、多标签编辑器、Markdown 与图片预览，以及新建/重命名/删除/下载的右键菜单。
 - 可直接把文件路径插入终端输入行，无需离开文件管理器。
 - 内置中文 tmux 指南，点击应用内的帮助按钮即可查阅。
+- 提供 macOS 与 Linux 原生桌面应用：原生菜单栏、平台快捷键、右键菜单、系统保存对话框、拖放插入路径，且无需登录（见[桌面应用](#桌面应用)）。
 - 会话名称支持包括中文在内的非 ASCII 字符（最多 64 字符）；保留/禁用 `:`、`.`、`/`、`\`、`;`、全角易混淆符号（`：`、`．`、`；`）、边缘空白及控制字符。
 - 浏览器断开不会影响后台会话，tmux 会话持续运行。
 - 采用 Bearer Token 认证与短期、一次性的 WebSocket 凭据（ticket）。
@@ -69,6 +70,35 @@ VISUAL_TMUX_CLIENT_TOKEN="$(openssl rand -base64 32)" ./visual-tmux-client
 ```
 
 运行 `./visual-tmux-client --help` 可查看全部参数和环境变量。
+
+## 桌面应用
+
+Visual Tmux Client 同时提供 macOS 与 Linux 原生桌面应用。应用在自身进程内以回环地址运行同一个 hub，并在原生窗口中展示同一套界面——浏览器端的全部功能都在，同时具备桌面应用应有的交互：
+
+- **无需登录。** 每次启动都会创建一个私有 hub 并生成新的令牌直接交给窗口，无需复制粘贴，且只监听 `127.0.0.1`。
+- **原生菜单栏**：文件、编辑、视图、会话、帮助。快捷键不会抢占终端按键：macOS 上全部使用 ⌘；Linux 上与 GNOME Terminal 一致，在 Ctrl 基础上加 Shift（`Ctrl+C`、`Ctrl+W`、`Ctrl+T` 仍交给 shell）。
+- **右键菜单**：会话卡片（打开、重命名、置顶、排序、结束）与终端区域（复制、粘贴、全选、清空回滚、文件、关闭面板）。tmux 开启鼠标模式时右键交给 tmux，按住 Shift 右键打开应用菜单。
+- **原生对话框与文件**：确认与输入使用应用内对话框；下载通过系统保存对话框（默认“下载”目录）；复制粘贴使用系统剪贴板；链接在系统浏览器中打开。
+- **拖放**：从 Finder 或文件管理器将文件拖到窗口上，即可把带引号的路径输入到终端，与终端应用的行为一致。
+- **窗口行为**：可拖动调整宽度的侧栏、记住窗口大小、原生全屏、标题栏显示当前会话、单实例（再次启动会唤起已有窗口）、存在未保存的文件修改时退出前提醒。退出应用不会结束任何 tmux 会话。
+
+| 操作 | macOS | Linux |
+| --- | --- | --- |
+| 新建会话 | ⌘T | Ctrl+Shift+T |
+| 关闭面板 | ⌘W | Ctrl+Shift+W |
+| 重命名会话 | F2 | F2 |
+| 下一个 / 上一个会话 | ⌥⌘→ / ⌥⌘← | Ctrl+Shift+↓ / Ctrl+Shift+↑ |
+| 切换到第 1–9 个会话 | ⌘1 … ⌘9 | Alt+1 … Alt+9 |
+| 复制 / 粘贴 | ⌘C / ⌘V | Ctrl+Shift+C / Ctrl+Shift+V |
+| 清空回滚 | ⌘K | Ctrl+Shift+K |
+| 切换侧栏 / 文件管理器 | ⌘B / ⇧⌘E | Ctrl+Shift+B / Ctrl+Shift+E |
+| 字号放大 / 缩小 / 重置 | ⌘= / ⌘- / ⌘0 | Ctrl+= / Ctrl+- / Ctrl+0 |
+| 全屏 | ⌃⌘F | F11 |
+| tmux 使用指南 | ⌘? | F1 |
+
+从 Releases 页面下载 `visual-tmux-client-desktop_<version>_darwin_universal.zip`（macOS）或 `visual-tmux-client-desktop_<version>_linux_amd64.tar.gz`（Linux）。macOS 版本未经公证，移动到“应用程序”后需执行一次 `xattr -dr com.apple.quarantine "/Applications/Visual Tmux Client.app"`。Linux 版本依赖 GTK 3 与 WebKitGTK 4.1（Debian/Ubuntu 为 `libwebkit2gtk-4.1-0`）；将 `visual-tmux-client.desktop` 复制到 `~/.local/share/applications/`、图标复制到 `~/.local/share/icons/` 即可出现在启动器中。
+
+桌面应用读取与服务端相同的 YAML 配置：配置目录中的 `visual-tmux-client.yaml`——macOS 为 `~/Library/Application Support/visual-tmux-client/`，Linux 为 `~/.config/visual-tmux-client/`（菜单“文件 → 打开配置文件夹”）——或通过 `--config <path>` 指定。服务端的监听地址与令牌设置不适用：桌面 hub 始终监听回环地址并使用每次启动生成的令牌。从程序坞或启动器打开时，应用会把常见包管理器目录（Homebrew、MacPorts、Nix、`~/.local/bin`）加入 `PATH` 以找到 `tmux`，并在未设置语言环境时提供 UTF-8 locale，确保 tmux 正确显示中文等非 ASCII 字符；配置中的 `tmux.path` 优先于自动查找。
 
 ## 配置说明
 
@@ -226,13 +256,23 @@ make package    # 在 release/ 中打包当前平台发布压缩包
 make clean      # 清理生成的构建产物和临时目录
 ```
 
+桌面应用是独立的 Go 模块 `hub/desktop`，基于 [Wails](https://wails.io) v2 构建。它需要 C 工具链，Linux 上还需要 GTK 3 与 WebKitGTK 开发包（Debian/Ubuntu 为 `libgtk-3-dev libwebkit2gtk-4.1-dev`）；上面的服务端构建两者都不需要。
+
+```sh
+make install-wails   # 安装固定版本的 Wails CLI
+make desktop         # 打包应用到 hub/desktop/build/bin（macOS 为 .app）
+make desktop-dev     # 直接 go build 桌面二进制，不打包
+make desktop-test    # 桌面模块测试与 go vet
+make desktop-lint    # 桌面模块的 golangci-lint 检查
+```
+
 如需一次生成多个平台的发布包：
 
 ```sh
 TARGETS="darwin/arm64 darwin/amd64 linux/arm64 linux/amd64" make package
 ```
 
-推送 `v*` 标签后，GitHub Actions 会自动触发发布工作流，构建以上四个平台并发布 GitHub Release。
+推送 `v*` 标签后，GitHub Actions 会自动触发发布工作流，构建以上四个平台以及 Linux（amd64）与 macOS（universal）桌面应用，并发布 GitHub Release。
 
 ## 架构说明
 
@@ -249,6 +289,8 @@ hub/internal/terminal/       终端输出背压缓冲、环形暂存队列、连
 hub/internal/transport/http/ REST API 路由、DTO 映射、鉴权中间件与嵌入式 SPA 静态托管
 hub/internal/transport/ws/   WebSocket 握手、Origin 校验矩阵、二进制流协议与 Peer 适配器
 hub/web/                     Vue 3 浏览器前端（Vite + TypeScript + xterm.js）
+hub/desktop/                 桌面应用（独立 Go 模块，Wails v2）：窗口、菜单与原生桥接
+hub/desktop/internal/        内嵌 hub 启动、页面与窗口间的桥接路由、快捷键、窗口状态、环境修复
 configs/                     示例配置文件模板
 ```
 

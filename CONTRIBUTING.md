@@ -27,6 +27,17 @@ make build
 
 The browser UI is under `hub/web`. For frontend development with hot reload, run `npm run dev` there. API requests still need a running Go server or an appropriate local proxy. Run `npm test` in `hub/web` to execute the web test suite.
 
+The desktop application is the separate Go module `hub/desktop` (Wails v2), so
+the server's build and `make test` never need a C toolchain or a web view. To
+work on it, install the platform's web view development packages (on Debian and
+Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`; on macOS the Xcode command line
+tools), then use `make desktop-test`, `make desktop-lint` and `make desktop-dev`
+(or `make install-wails` and `make desktop` for a packaged build). Its unit tests
+use test doubles and start no tmux. A manually launched desktop build does use
+tmux, and like the server it reaches the default socket unless `TMUX_TMPDIR`
+points at a private directory, so start it the same way you would start the
+server for a manual check.
+
 ## Tmux safety
 
 Even outside tmux, an unqualified command can reach an existing server.

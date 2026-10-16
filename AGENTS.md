@@ -46,7 +46,9 @@ socket with `-S` or `-L`. Cleanup must use the same environment and socket.
 - Do not weaken helpers to pass a test. Any new package that starts tmux needs
   `func TestMain(m *testing.M) { os.Exit(testutil.ParentGuard(m)) }`.
   It is currently installed in the CLI and tmux packages. The testutil package
-  tests the guard itself against disposable servers.
+  tests the guard itself against disposable servers. The desktop module
+  (`hub/desktop`) starts its embedded hub against test doubles and runs no tmux;
+  a desktop test that ever does needs the guard too.
 
 ParentGuard detects server/session-list changes after tests; it cannot prevent
 all damage or detect every pane/option mutation. Never treat a green test as
