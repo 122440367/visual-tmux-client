@@ -7,8 +7,13 @@ import {
   type ClientConfig,
 } from './config'
 import {
+  clearTerminalScrollback,
   computeReconnectDelay,
+  pasteIntoTerminal,
+  selectAllInTerminal,
   shouldThrottleActivity,
+  terminalSelection,
+  terminalTracksMouse,
   TerminalSession,
   type TerminalHooks,
 } from './terminal'
@@ -279,6 +284,56 @@ test('TerminalSession registers online/offline listeners and cleans them up on d
     globalThis.ResizeObserver = originalResizeObserver
     globalThis.WebSocket = originalWebSocket
     ;(globalThis as any).window = originalWindow
+    resetConfigForTest()
+  }
+})
+
+test('clipboard helpers act on the named session and refuse a paste without an attachment', () => {
+  setConfig(nonDefaultConfig)
+  const originalResizeObserver = globalThis.ResizeObserver
+  const originalWebSocket = globalThis.WebSocket
+  class MockResizeObserver {
+    observe() {}
+    disconnect() {}
+  }
+  class MockWebSocket {
+    static OPEN = 1
+    readyState = 0
+    close() {}
+    send() {}
+  }
+  globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver
+  globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket
+  try {
+    const hooks: TerminalHooks = { onState: () => {}, onNotice: () => {} }
+    const session = new TerminalSession({ clientWidth: 640, clientHeight: 480 } as HTMLElement, 'clip', hooks)
+    const termAny = (session as any).term
+
+    termAny.selected = 'hello'
+    assert.equal(terminalSelection('clip'), 'hello')
+    assert.equal(terminalSelection('other'), '')
+
+    // No open socket: the paste would vanish, so it is refused.
+    assert.equal(pasteIntoTerminal('clip', 'ls'), false)
+    ;(session as any).ws = { readyState: 1, send() {}, close() {} }
+    assert.equal(pasteIntoTerminal('clip', 'ls'), true)
+    assert.deepEqual(termAny.pasted, ['ls'])
+
+    assert.equal(selectAllInTerminal('clip'), true)
+    assert.equal(termAny.allSelected, true)
+    assert.equal(clearTerminalScrollback('clip'), true)
+    assert.equal(termAny.cleared, 1)
+    assert.equal(clearTerminalScrollback('other'), false)
+
+    assert.equal(terminalTracksMouse('clip'), false)
+    termAny.modes = { mouseTrackingMode: 'vt200' }
+    assert.equal(terminalTracksMouse('clip'), true)
+
+    ;(session as any).ws = null
+    session.dispose()
+  } finally {
+    globalThis.ResizeObserver = originalResizeObserver
+    globalThis.WebSocket = originalWebSocket
     resetConfigForTest()
   }
 })

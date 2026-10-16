@@ -14,7 +14,16 @@ export class Terminal {
   onResize() {}
   write() {}
   getSelection() {
-    return null
+    return this.selected ?? ''
+  }
+  paste(text) {
+    this.pasted = [...(this.pasted ?? []), text]
+  }
+  selectAll() {
+    this.allSelected = true
+  }
+  clear() {
+    this.cleared = (this.cleared ?? 0) + 1
   }
   focus() {}
   dispose() {}

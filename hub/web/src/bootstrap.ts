@@ -46,6 +46,10 @@ export async function bootstrapApp(
   rootEl: HTMLElement,
   fetchFn?: typeof fetch,
   mountFn?: (el: HTMLElement) => void,
+  // Work that has to finish before the application reads its environment --
+  // the desktop shell identifying itself. It runs after the configuration
+  // loads and must not throw: what it prepares is optional.
+  prepare?: () => Promise<unknown>,
 ): Promise<boolean> {
   if (mounted) return true
 
@@ -53,6 +57,7 @@ export async function bootstrapApp(
 
   try {
     await fetchClientConfig(fetchFn)
+    if (prepare) await prepare()
     if (mounted) return true
     mounted = true
     rootEl.innerHTML = ''

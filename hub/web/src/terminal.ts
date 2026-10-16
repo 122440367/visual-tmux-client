@@ -9,6 +9,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { issueTicket, AuthError } from './api'
 import { getConfig } from './config'
+import { isDesktop, writeClipboard } from './desktop'
 
 export type ConnState = 'connecting' | 'connected' | 'reconnecting' | 'ended'
 
@@ -107,6 +108,60 @@ export function insertIntoTerminal(name: string, text: string): boolean {
   return false
 }
 
+function find(name: string): TerminalSession | undefined {
+  for (const s of liveSessions) {
+    if (s.name === name) return s
+  }
+  return undefined
+}
+
+/** terminalSelection returns the text selected in the session's terminal, or ''
+ * when nothing is selected or there is no such terminal. */
+export function terminalSelection(name: string): string {
+  return find(name)?.selection() ?? ''
+}
+
+/** pasteIntoTerminal pastes text into the session as if it came from the
+ * clipboard. Unlike insertIntoTerminal it goes through xterm's paste, so a
+ * program that asked for bracketed paste receives one -- which is what keeps a
+ * pasted line from running before the user has looked at it. */
+export function pasteIntoTerminal(name: string, text: string): boolean {
+  return find(name)?.paste(text) ?? false
+}
+
+/** selectAllInTerminal selects the session's whole buffer. */
+export function selectAllInTerminal(name: string): boolean {
+  const s = find(name)
+  s?.selectAll()
+  return s !== undefined
+}
+
+/** clearTerminalScrollback drops the terminal's local scrollback, keeping the
+ * visible screen. tmux keeps its own history, which this does not touch. */
+export function clearTerminalScrollback(name: string): boolean {
+  const s = find(name)
+  s?.clearScrollback()
+  return s !== undefined
+}
+
+/** focusTerminal puts the keyboard on the session's terminal. */
+export function focusTerminal(name: string): void {
+  find(name)?.focus()
+}
+
+/** terminalTracksMouse reports whether the program in the session's terminal
+ * asked for mouse reports. tmux does whenever its `mouse` option is on, and it
+ * answers a right click with a menu of its own, so the page must not put a
+ * second one on top. */
+export function terminalTracksMouse(name: string): boolean {
+  return find(name)?.tracksMouse() ?? false
+}
+
+/** terminalHasFocus reports whether the keyboard is in the session's terminal. */
+export function terminalHasFocus(name: string): boolean {
+  return find(name)?.hasFocus() ?? false
+}
+
 export class TerminalSession {
   private term: Terminal
   private fit: FitAddon
@@ -175,6 +230,14 @@ export class TerminalSession {
       if (!isCopy) return true
       const selection = this.term.getSelection()
       if (!selection) return true
+      // The desktop shell owns the system clipboard and writes it without the
+      // permission rules a web view applies to navigator.clipboard.
+      if (isDesktop()) {
+        writeClipboard(selection).catch(() => {
+          this.hooks.onNotice('Copy failed: the clipboard could not be written.', 'warning')
+        })
+        return false
+      }
       // navigator.clipboard exists only in a secure context. Served over plain
       // HTTP to anything but localhost — the documented LAN deployment — it is
       // undefined, and calling .writeText on it throws a TypeError out of
@@ -459,6 +522,37 @@ export class TerminalSession {
     if (!this.isAttached()) return false
     this.sendBinary(text)
     return true
+  }
+
+  /** selection is the text currently selected in the terminal. */
+  selection(): string {
+    return this.term.getSelection()
+  }
+
+  /** paste hands text to xterm's own paste path, which applies bracketed paste
+   * when the program asked for it. Refused without a live attachment, for the
+   * same reason as insertText. */
+  paste(text: string): boolean {
+    if (!this.isAttached()) return false
+    this.term.paste(text)
+    return true
+  }
+
+  selectAll(): void {
+    this.term.selectAll()
+  }
+
+  clearScrollback(): void {
+    this.term.clear()
+  }
+
+  tracksMouse(): boolean {
+    const mode = this.term.modes?.mouseTrackingMode
+    return mode !== undefined && mode !== 'none'
+  }
+
+  hasFocus(): boolean {
+    return typeof document !== 'undefined' && this.container.contains(document.activeElement)
   }
 
   // Byte-per-char payloads (onBinary) must not be re-encoded as UTF-8.

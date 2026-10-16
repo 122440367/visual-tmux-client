@@ -22,6 +22,9 @@ import { createPending } from '../../files/pending'
 import { reasonFor as reasonForCode } from '../../files/reasons'
 import { createPathChanges } from '../../files/pathChanges'
 import { getConfig } from '../../config'
+import { askConfirm, askText } from '../../dialogs'
+import { isDesktop, saveDownload, writeClipboard } from '../../desktop'
+import { notify } from '../../toasts'
 import type { Classification } from '../../files/classification'
 import { choosePreview, editable, namesAnImage, presentation, wantsText } from '../../files/preview'
 import {
@@ -558,8 +561,9 @@ async function save(
       return
     }
     if (err instanceof FileApiError && err.code === 'conflict') {
-      const overwrite = window.confirm(
+      const overwrite = await askConfirm(
         `${tab.name} changed on disk since it was opened. Overwrite it with your version?`,
+        { title: 'File changed on disk', confirmLabel: 'Overwrite', danger: true },
       )
       // The agreement about other names travels with the retry: the user gave it
       // for this write, and asking for it again on the way to the same write
@@ -580,9 +584,10 @@ async function save(
       // observation travels with it because the tab has not changed it, and it is
       // the tab's own, so a save of the newest text is still checked against what
       // the hub last reported.
-      const replace = window.confirm(
+      const replace = await askConfirm(
         `${tab.name} is reachable under other names as well. Saving replaces this file, and ` +
           `the other names keep the contents they have now. Save anyway?`,
+        { title: 'File has other names', confirmLabel: 'Save anyway' },
       )
       if (replace) await save(force, tab.id, true)
       return
@@ -623,9 +628,17 @@ function isSameTab(id: number): boolean {
   return liveTab(id) !== undefined
 }
 
-function closeTab(path: string) {
+async function closeTab(path: string) {
   const tab = tabs.value.find((candidate) => candidate.path === path)
-  if (tab && isDirty(tab) && !window.confirm(`${tab.name} has unsaved changes. Close it anyway?`)) {
+  if (
+    tab &&
+    isDirty(tab) &&
+    !(await askConfirm(`${tab.name} has unsaved changes. Close it anyway?`, {
+      title: 'Unsaved changes',
+      confirmLabel: 'Discard changes',
+      danger: true,
+    }))
+  ) {
     return
   }
   tabs.value = tabs.value.filter((candidate) => candidate.path !== path)
@@ -659,8 +672,15 @@ async function replaceTabFocus() {
 
 /** requestClose warns before discarding unsaved edits, which are not recoverable
  * once the panel is gone. */
-function requestClose() {
-  if (dirty.value && !window.confirm('Files have unsaved changes. Close the file manager anyway?')) {
+async function requestClose() {
+  if (
+    dirty.value &&
+    !(await askConfirm('Files have unsaved changes. Close the file manager anyway?', {
+      title: 'Unsaved changes',
+      confirmLabel: 'Discard changes',
+      danger: true,
+    }))
+  ) {
     return
   }
   emit('close')
@@ -754,9 +774,16 @@ async function createHere(isDir: boolean) {
   // lost either way -- though which of the two the screen is left showing is not
   // guaranteed, since the two listings race -- so there is nothing here for the
   // ordering to protect.
-  const name = window.prompt(isDir ? 'New directory name' : 'New file name')
+  // The directory is the one the question was asked in. The desktop shell asks
+  // without blocking the page, and the answer must not land in a directory the
+  // listing moved to while the dialog was up.
+  const directory = current.value
+  const name = await askText(isDir ? 'New directory name' : 'New file name', {
+    title: isDir ? 'New directory' : 'New file',
+    confirmLabel: 'Create',
+  })
   if (!name) return
-  const path = joinPath(current.value, name)
+  const path = joinPath(directory, name)
   try {
     await createEntry(path, isDir)
     await settleMutation(path)
@@ -879,8 +906,12 @@ async function readRenamedTab(id: number, path: string) {
   }
 }
 
-function renameTarget(entry: Entry, path: string) {
-  const name = window.prompt('Rename to', entry.name)
+async function renameTarget(entry: Entry, path: string) {
+  const name = await askText('Rename to', {
+    title: `Rename ${entry.name}`,
+    initial: entry.name,
+    confirmLabel: 'Rename',
+  })
   if (!name || name === entry.name) return
   const target = joinPath(dirname(path), name)
   renaming.begin(path)
@@ -912,7 +943,7 @@ async function deleteTarget(entry: Entry, path: string) {
     const names = unsaved.map((tab) => tab.name).join(', ')
     question += `\n\nOpen with unsaved changes: ${names}. Those edits will be lost.`
   }
-  if (!window.confirm(question)) {
+  if (!(await askConfirm(question, { title: `Delete ${kind}`, confirmLabel: 'Delete', danger: true }))) {
     return
   }
 
@@ -1008,6 +1039,19 @@ async function deleteTarget(entry: Entry, path: string) {
 }
 
 async function download(path: string, name: string) {
+  if (isDesktop()) {
+    // A web view does not act on <a download>; the shell asks where to save
+    // and fetches the file itself.
+    try {
+      const result = await saveDownload(path, name)
+      if (result.saved) notify('info', `Saved ${name}${result.target ? ` to ${result.target}` : ''}`)
+    } catch (err) {
+      // The shell answers with the hub's own refusal code when the hub refused,
+      // so it is worded through the same table as every other file error.
+      report(err instanceof Error ? new FileApiError(err.message) : err, `Could not download ${name}`)
+    }
+    return
+  }
   try {
     const blob = await downloadFile(path)
     const url = URL.createObjectURL(blob)
@@ -1022,6 +1066,14 @@ async function download(path: string, name: string) {
 }
 
 async function copyPathToClipboard(path: string) {
+  if (isDesktop()) {
+    try {
+      await writeClipboard(path)
+    } catch {
+      emit('notice', 'Copy failed.', 'warning')
+    }
+    return
+  }
   const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined
   if (!clipboard) {
     emit(
@@ -1060,7 +1112,7 @@ function onMenuAction(action: string) {
       void createHere(true)
       break
     case 'rename':
-      renameTarget(target.entry, target.path)
+      void renameTarget(target.entry, target.path)
       break
     case 'delete':
       void deleteTarget(target.entry, target.path)
@@ -1141,7 +1193,7 @@ function onKeydown(event: KeyboardEvent) {
   // close the whole manager.
   const target = event.target
   if (target instanceof HTMLElement && target.closest('.code-editor') !== null) return
-  requestClose()
+  void requestClose()
 }
 
 onMounted(() => {

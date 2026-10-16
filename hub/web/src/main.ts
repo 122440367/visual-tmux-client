@@ -3,6 +3,7 @@ import App from './App.vue'
 import './style.css'
 import '@xterm/xterm/css/xterm.css'
 import { bootstrapApp } from './bootstrap'
+import { adoptDesktopLaunch, initDesktop, installCommandReceiver } from './desktop'
 
 // Global error surface: surface any uncaught JS error / rejection as a
 // visible banner so runtime failures are diagnosable without the console.
@@ -25,8 +26,17 @@ window.addEventListener('unhandledrejection', (e) => {
 if (typeof document !== 'undefined') {
   const root = document.getElementById('app')
   if (root) {
-    void bootstrapApp(root, undefined, (el) => {
-      createApp(App).mount(el)
-    })
+    // Read before anything reads the stored token: the desktop shell passes a
+    // fresh one in the address on every launch.
+    const launched = adoptDesktopLaunch()
+    installCommandReceiver()
+    void bootstrapApp(
+      root,
+      undefined,
+      (el) => {
+        createApp(App).mount(el)
+      },
+      () => initDesktop(launched),
+    )
   }
 }
