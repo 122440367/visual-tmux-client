@@ -18,6 +18,35 @@ const emit = defineEmits<{ (e: 'update:modelValue', value: string): void }>()
 const host = ref<HTMLElement | null>(null)
 let view: EditorView | null = null
 
+// CodeMirror's own theme is a light one, which put a white gutter and a pale
+// active line inside an otherwise dark page. This one is drawn from the page's
+// tokens (style.css), so the editor reads as part of the same surface, and is
+// marked dark so the editor picks its dark defaults for everything not listed.
+const pageTheme = EditorView.theme(
+  {
+    '&': { color: 'var(--th-text-hi)', backgroundColor: 'var(--app-bg)' },
+    '.cm-content': { caretColor: 'var(--th-text-hi)' },
+    '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--th-text-hi)' },
+    '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection':
+      { backgroundColor: 'rgb(96 165 250 / 30%)' },
+    '.cm-gutters': {
+      backgroundColor: 'var(--th-surface)',
+      color: 'var(--th-text-lo)',
+      borderRight: '1px solid var(--th-border)',
+    },
+    '.cm-activeLine': { backgroundColor: 'rgb(255 255 255 / 4%)' },
+    '.cm-activeLineGutter': { backgroundColor: 'rgb(255 255 255 / 6%)', color: 'var(--th-text-mid)' },
+    '.cm-foldPlaceholder': { backgroundColor: 'var(--th-raised)', border: 'none', color: 'var(--th-text-mid)' },
+    '.cm-searchMatch': { backgroundColor: 'rgb(250 204 21 / 25%)', outline: '1px solid rgb(250 204 21 / 45%)' },
+    '.cm-searchMatch.cm-searchMatch-selected': { backgroundColor: 'rgb(96 165 250 / 35%)' },
+    '.cm-matchingBracket, .cm-nonmatchingBracket': { backgroundColor: 'rgb(255 255 255 / 10%)' },
+    '.cm-panels': { backgroundColor: 'var(--th-surface)', color: 'var(--th-text-hi)' },
+    '.cm-panels.cm-panels-bottom': { borderTop: '1px solid var(--th-border)' },
+    '.cm-tooltip': { backgroundColor: 'var(--th-raised)', border: '1px solid var(--th-border)' },
+  },
+  { dark: true },
+)
+
 onMounted(() => {
   if (!host.value) return
   view = new EditorView({
@@ -25,6 +54,7 @@ onMounted(() => {
     parent: host.value,
     extensions: [
       basicSetup,
+      pageTheme,
       EditorView.updateListener.of((update) => {
         if (update.docChanged) emit('update:modelValue', update.state.doc.toString())
       }),

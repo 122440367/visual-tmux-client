@@ -14,6 +14,11 @@ export function reset() {
 }
 
 export class EditorView {
+  /** theme builds an extension the stand-in has no use for. */
+  static theme() {
+    return {}
+  }
+
   constructor(options) {
     this.options = options
     this.doc = String(options.doc ?? '')
