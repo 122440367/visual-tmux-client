@@ -12,6 +12,10 @@
     --th-danger: #f87171;
     --th-warning: #facc15;
     --th-green: #4ade80;
+    /* A border that still reads on a raised surface, where --th-border (the
+       same value as --th-raised) disappears. */
+    --th-border-strong: #333333;
+    --th-sidebar: #121212;
     --app-ui-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --app-code-font: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
@@ -49,4 +53,18 @@ body {
     clip: rect(0, 0, 0, 0);
     white-space: nowrap;
     border: 0;
+}
+
+/* The desktop shell's window has no browser chrome around it, so the page
+   is the whole window: nothing should scroll it, and the cursor over chrome
+   is the platform's arrow rather than a text caret. */
+html[data-desktop] body {
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+}
+html[data-desktop] :where(input, textarea, [contenteditable], .xterm, .help__markdown, .cm-editor) {
+    user-select: text;
+    -webkit-user-select: text;
 }

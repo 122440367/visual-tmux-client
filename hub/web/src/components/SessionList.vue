@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { Session } from '../api'
+import { askConfirm } from '../dialogs'
+import { shortcutFor } from '../desktop'
+import ContextMenu, { type MenuItem } from './ContextMenu.vue'
 import { buildSubtitleMap, rowLabel } from '../sessionSubtitle'
 import { notify } from '../toasts'
 import {
@@ -19,9 +22,13 @@ const props = withDefaults(
     /** Sessions with terminal output in the last few seconds. */
     active: Record<string, boolean>
     creating?: boolean
+    /** Desktop-shell behaviour: rows answer a right click with a menu, and a
+     * kill is confirmed in a dialog rather than in the strip under the list. */
+    desktop?: boolean
   }>(),
   {
     creating: false,
+    desktop: false,
   },
 )
 
@@ -234,8 +241,16 @@ function submitRename(oldName: string): void {
 
 const confirmingKill = ref<string | null>(null)
 
-function requestKill(name: string): void {
-  confirmingKill.value = name
+async function requestKill(name: string): Promise<void> {
+  if (!props.desktop) {
+    confirmingKill.value = name
+    return
+  }
+  const ok = await askConfirm(
+    `Kill session “${name}”? Every program running in it will be terminated.`,
+    { title: 'Kill session', confirmLabel: 'Kill', danger: true },
+  )
+  if (ok && props.sessions.some((s) => s.name === name)) emit('kill', name)
 }
 
 function confirmKill(): void {
@@ -261,10 +276,73 @@ watch(
     if (renaming.value !== null && !names.has(renaming.value)) {
       renaming.value = null
     }
+    if (menu.value !== null && !names.has(menu.value.name)) {
+      menu.value = null
+    }
   },
 )
 
 const manualMode = computed(() => order.value.mode === 'manual')
+
+// --- Right-click menu (desktop shell) ---
+
+const menu = ref<{ x: number; y: number; name: string } | null>(null)
+
+function openMenu(name: string, ev: MouseEvent): void {
+  if (!props.desktop || selecting.value || renaming.value === name) return
+  ev.preventDefault()
+  menu.value = { x: ev.clientX, y: ev.clientY, name }
+}
+
+const menuItems = computed<MenuItem[]>(() => {
+  const name = menu.value?.name
+  if (name === undefined) return []
+  const items: MenuItem[] = [
+    { id: 'open', label: name === props.selected ? 'Focus Terminal' : 'Open' },
+    { id: 'rename', label: 'Rename…', shortcut: shortcutFor('rename-session') },
+  ]
+  if (manualMode.value) {
+    items.push(
+      { id: 'pin', label: isPinned(name) ? 'Unpin' : 'Pin to Top', separated: true },
+      { id: 'up', label: 'Move Up', disabled: !canMove(name, -1) },
+      { id: 'down', label: 'Move Down', disabled: !canMove(name, 1) },
+    )
+  }
+  items.push({ id: 'kill', label: 'Kill Session…', danger: true, separated: true })
+  return items
+})
+
+function onMenuSelect(id: string): void {
+  const name = menu.value?.name
+  if (name === undefined) return
+  switch (id) {
+    case 'open':
+      emit('select', name)
+      break
+    case 'rename':
+      startRename(name)
+      break
+    case 'pin':
+      togglePin(name)
+      break
+    case 'up':
+      moveBy(name, -1)
+      break
+    case 'down':
+      moveBy(name, 1)
+      break
+    case 'kill':
+      void requestKill(name)
+      break
+  }
+}
+
+defineExpose({
+  startRename,
+  requestKill,
+  /** The sessions in the order the list shows them, for next/previous. */
+  orderedNames: (): string[] => ordered.value.map((s) => s.name),
+})
 </script>
 
 <template>
@@ -332,6 +410,7 @@ const manualMode = computed(() => order.value.mode === 'manual')
         @dragleave="dragOverName === s.name && (dragOverName = null)"
         @drop.prevent="onDrop(s.name)"
         @dragend="dragName = null; dragOverName = null"
+        @contextmenu="openMenu(s.name, $event)"
       >
         <div v-if="renaming === s.name" class="session-list__rename" @click.stop>
           <input
@@ -401,7 +480,7 @@ const manualMode = computed(() => order.value.mode === 'manual')
                 type="button"
                 title="kill"
                 :aria-label="`Kill ${s.name}`"
-                @click="requestKill(s.name)"
+                @click="void requestKill(s.name)"
               ><span aria-hidden="true">✕</span></button>
             </span>
           </div>
@@ -435,6 +514,16 @@ const manualMode = computed(() => order.value.mode === 'manual')
       <button class="session-list__btn session-list__btn--danger" type="button" @click="confirmKill">Kill</button>
       <button class="session-list__btn" type="button" @click="confirmingKill = null">Cancel</button>
     </div>
+
+    <ContextMenu
+      v-if="menu"
+      :x="menu.x"
+      :y="menu.y"
+      :title="menu.name"
+      :items="menuItems"
+      @select="onMenuSelect"
+      @close="menu = null"
+    />
   </div>
 </template>
 
