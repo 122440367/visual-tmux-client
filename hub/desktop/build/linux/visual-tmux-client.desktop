@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Visual Tmux Client
+GenericName=tmux Session Manager
+Comment=Manage and use tmux sessions in a native window
+Exec=visual-tmux-client-desktop
+Icon=visual-tmux-client
+Terminal=false
+Categories=Development;System;TerminalEmulator;
+Keywords=tmux;terminal;session;shell;
+StartupWMClass=visual-tmux-client
+StartupNotify=true

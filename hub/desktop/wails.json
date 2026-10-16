@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Visual Tmux Client",
+  "outputfilename": "visual-tmux-client-desktop",
+  "frontend:dir": "../web",
+  "frontend:install": "npm ci",
+  "frontend:build": "npm run build",
+  "wailsjsdir": "./build/wailsjs",
+  "author": {
+    "name": "Visual Tmux Client contributors"
+  },
+  "info": {
+    "companyName": "Visual Tmux Client",
+    "productName": "Visual Tmux Client",
+    "productVersion": "0.3.1",
+    "copyright": "Copyright © Visual Tmux Client contributors. MIT License.",
+    "comments": "Manage and use tmux sessions in a native window."
+  }
+}

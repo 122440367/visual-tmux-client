@@ -22,3 +22,10 @@ hub/visual-tmux-client
 
 # OS cruft
 .DS_Store
+
+# Desktop build output (Wails)
+hub/desktop/build/bin/
+hub/desktop/build/wailsjs/
+hub/desktop/build/windows/
+hub/web/package.json.md5
+hub/desktop/build/darwin/Info.dev.plist
