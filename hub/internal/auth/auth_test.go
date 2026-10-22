@@ -105,6 +105,59 @@ func TestTicketLifecycle(t *testing.T) {
 	}
 }
 
+func TestTicketTargetBinding(t *testing.T) {
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	currentTime := baseTime
+	nowFunc := func() time.Time { return currentTime }
+
+	ttl := 30 * time.Second
+	store := NewTicketStore(ttl, nowFunc)
+
+	// 1. Cross-host same session name refusal and single-use invalidation
+	id, _, err := store.IssueForTarget("host-a", 1, "dev")
+	if err != nil {
+		t.Fatalf("IssueForTarget failed: %v", err)
+	}
+	if err := store.RedeemForTarget(id, "host-b", 1, "dev"); !errors.Is(err, ErrTicketHostMismatch) {
+		t.Fatalf("expected ErrTicketHostMismatch, got %v", err)
+	}
+	// Cannot reuse on host-a after failed attempt
+	if err := store.RedeemForTarget(id, "host-a", 1, "dev"); !errors.Is(err, ErrTicketInvalid) {
+		t.Fatalf("expected ErrTicketInvalid after cross-host failure, got %v", err)
+	}
+
+	// 2. Superseded revision refusal and single-use invalidation
+	idRev, _, err := store.IssueForTarget("host-a", 1, "dev")
+	if err != nil {
+		t.Fatalf("IssueForTarget failed: %v", err)
+	}
+	if err := store.RedeemForTarget(idRev, "host-a", 2, "dev"); !errors.Is(err, ErrTicketSuperseded) {
+		t.Fatalf("expected ErrTicketSuperseded, got %v", err)
+	}
+	// Cannot reuse after superseded failure
+	if err := store.RedeemForTarget(idRev, "host-a", 1, "dev"); !errors.Is(err, ErrTicketInvalid) {
+		t.Fatalf("expected ErrTicketInvalid after revision mismatch, got %v", err)
+	}
+
+	// 3. Local route compatibility: Issue() and Redeem() map to host="local", rev=1
+	idLocal, _, err := store.Issue("local-sess")
+	if err != nil {
+		t.Fatalf("Issue failed: %v", err)
+	}
+	if err := store.RedeemForTarget(idLocal, "local", 1, "local-sess"); err != nil {
+		t.Fatalf("RedeemForTarget on local ticket failed: %v", err)
+	}
+
+	// 4. Defaulting empty hostID and 0 connRev to "local" and 1
+	idDef, _, err := store.IssueForTarget("", 0, "default-sess")
+	if err != nil {
+		t.Fatalf("IssueForTarget with defaults failed: %v", err)
+	}
+	if err := store.Redeem(idDef, "default-sess"); err != nil {
+		t.Fatalf("Redeem on defaulted ticket failed: %v", err)
+	}
+}
+
 func TestTicketSweep(t *testing.T) {
 	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	currentTime := baseTime
@@ -313,5 +366,48 @@ func TestTicketStore_NilNowFallback(t *testing.T) {
 	}
 	if err := store.Redeem(id, "sess-realtime"); err != nil {
 		t.Errorf("Redeem failed: %v", err)
+	}
+}
+
+func TestTicketStoreInvalidation(t *testing.T) {
+	store := NewTicketStore(5*time.Minute, nil)
+
+	tktA1, _, err := store.IssueForTarget("host-a", 1, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tktA2, _, err := store.IssueForTarget("host-a", 2, "sess-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tktB, _, err := store.IssueForTarget("host-b", 1, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Invalidate connection revision 1 on host-a
+	store.InvalidateConnection("host-a", 1)
+
+	// tktA1 (rev 1) should be gone
+	if err := store.RedeemForTarget(tktA1, "host-a", 1, "sess-1"); !errors.Is(err, ErrTicketInvalid) {
+		t.Fatalf("expected ErrTicketInvalid for invalidated connection revision, got: %v", err)
+	}
+	// tktA2 (rev 2) remains valid
+	if err := store.RedeemForTarget(tktA2, "host-a", 2, "sess-2"); err != nil {
+		t.Fatalf("expected tktA2 to remain valid: %v", err)
+	}
+	// tktB remains valid
+	if err := store.RedeemForTarget(tktB, "host-b", 1, "sess-1"); err != nil {
+		t.Fatalf("expected tktB to remain valid: %v", err)
+	}
+
+	// Re-issue for host-b and test InvalidateHost
+	tktB2, _, err := store.IssueForTarget("host-b", 1, "sess-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.InvalidateHost("host-b")
+	if err := store.RedeemForTarget(tktB2, "host-b", 1, "sess-2"); !errors.Is(err, ErrTicketInvalid) {
+		t.Fatalf("expected ErrTicketInvalid after InvalidateHost, got: %v", err)
 	}
 }

@@ -4,15 +4,18 @@ import {
   AuthError,
   clearToken,
   createSession,
+  getHostSettings,
   getToken,
   isHeaderSafeToken,
   killSession,
+  listHosts,
   listSessions,
   renameSession,
   setToken,
+  type HostItem,
   type Session,
 } from './api'
-import { notify } from './toasts'
+import { notify, type ToastLevel } from './toasts'
 import {
   disposeTerminalSession,
   insertIntoTerminal,
@@ -24,6 +27,7 @@ import SessionList from './components/SessionList.vue'
 import TerminalView from './components/TerminalView.vue'
 import ToastStack from './components/ToastStack.vue'
 import HelpModal from './components/HelpModal.vue'
+import HostManagerModal from './components/HostManagerModal.vue'
 
 // The file manager is loaded when it is first opened. It carries the editor,
 // which is by far the largest dependency in the application and is of no use to
@@ -39,9 +43,137 @@ const tokenInput = ref('')
 const authError = ref('')
 const authBusy = ref(false)
 
+const RECENT_HOST_KEY = 'vtc:recent-host'
+const availableHosts = ref<HostItem[]>([])
+const currentHostId = ref<string | null>(null)
+const activeHostRemoved = ref(false)
+const hostDiscoveryLoading = ref(false)
+const hostDiscoveryError = ref('')
+const hasInitializedWorkspace = ref(false)
+
+const currentHost = computed<HostItem | null>(() => {
+  if (!currentHostId.value) return null
+  return availableHosts.value.find((h) => h.id === currentHostId.value) ?? null
+})
+const currentHostName = computed(() => currentHost.value?.name || currentHost.value?.id || '')
+const currentHostRevision = computed(() => currentHost.value?.revision ?? 0)
+const currentHostConnectionRevision = computed(() => currentHost.value?.connectionRevision ?? 0)
+
+function selectHost(id: string): void {
+  currentHostId.value = id
+  hasInitializedWorkspace.value = true
+  onHostChange()
+}
+
+function handleActiveHostRemoved(removedId: string): void {
+  if (currentHostId.value === removedId) {
+    stopPolling()
+    activeHostRemoved.value = true
+    if (filesDirty.value) {
+      fileManagerOpen.value = true
+    }
+    // Dropping panels for the removed host so no new input is sent
+    for (const key of Object.keys(panelIds.value)) {
+      const colon = key.indexOf(':')
+      const host = colon >= 0 ? key.slice(0, colon) : 'local'
+      const name = colon >= 0 ? key.slice(colon + 1) : key
+      if (host === removedId) {
+        disposeTerminalSession(name, host)
+      }
+    }
+    try {
+      const recent = localStorage.getItem(RECENT_HOST_KEY)
+      if (recent === removedId) {
+        localStorage.removeItem(RECENT_HOST_KEY)
+      }
+    } catch {
+      /* ignore storage quota */
+    }
+  }
+}
+
+async function loadAvailableHosts(isBootstrap = false): Promise<void> {
+  if (!hasToken.value) return
+  hostDiscoveryLoading.value = true
+  hostDiscoveryError.value = ''
+  try {
+    const prevConnRev = currentHost.value?.connectionRevision
+    const [list, settings] = await Promise.all([
+      listHosts(),
+      getHostSettings().catch(() => null),
+    ])
+    availableHosts.value = Array.isArray(list) ? list : []
+    hostDiscoveryLoading.value = false
+    const nextConnRev = currentHost.value?.connectionRevision
+
+    if (availableHosts.value.length === 0) {
+      if (currentHostId.value && !activeHostRemoved.value) {
+        handleActiveHostRemoved(currentHostId.value)
+      } else if (!activeHostRemoved.value) {
+        currentHostId.value = null
+      }
+      return
+    }
+
+    if (isBootstrap || currentHostId.value === null) {
+      // 1. Remembered recent host if still registered
+      const recent = localStorage.getItem(RECENT_HOST_KEY)
+      if (recent && availableHosts.value.some((h) => h.id === recent)) {
+        selectHost(recent)
+        return
+      }
+
+      // 2. Registered default host if still registered
+      if (
+        settings?.defaultHostId &&
+        availableHosts.value.some((h) => h.id === settings.defaultHostId)
+      ) {
+        selectHost(settings.defaultHostId)
+        return
+      }
+
+      // 3. Otherwise present host selection without guessing
+      currentHostId.value = null
+      return
+    }
+
+    // Active use: check if active host was removed
+    if (currentHostId.value && !availableHosts.value.some((h) => h.id === currentHostId.value)) {
+      handleActiveHostRemoved(currentHostId.value)
+      return
+    }
+
+    if (
+      prevConnRev !== undefined &&
+      nextConnRev !== undefined &&
+      prevConnRev !== nextConnRev &&
+      currentHostId.value &&
+      !activeHostRemoved.value
+    ) {
+      selected.value = null
+      void refresh()
+    }
+  } catch (err) {
+    hostDiscoveryLoading.value = false
+    if (err instanceof AuthError) {
+      handleAuthFailure()
+      return
+    }
+    hostDiscoveryError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
 const sessions = ref<Session[]>([])
 const listError = ref('')
+const listStale = ref(false)
 const selected = ref<string | null>(null)
+const managerInitialHostId = ref<string | null>(null)
+const cachedSessionsByHost = shallowRef<Record<string, Session[]>>(nameMap())
+
+function openHostManagerFor(hostId: string | null): void {
+  managerInitialHostId.value = hostId
+  hostManagerOpen.value = true
+}
 
 // Every map keyed by session name uses this, and a session name is arbitrary
 // user text: the hub accepts anything that is valid UTF-8 without `:`, `.`,
@@ -78,18 +210,25 @@ const hasToken = computed(() => !!token.value)
 // longer exists while a second attachment mounts beside it. Keying by a stable
 // per-session id that renames carry over keeps one panel per session, so a
 // rename reuses the existing attachment instead of leaking it.
+// Panel keys are scoped by host so same-named sessions on different hosts have
+// separate panel identities in KeepAlive.
 const panelIds = shallowRef<Record<string, number>>(nameMap())
 let nextPanelId = 1
 
+function panelKey(name: string, hostId = currentHostId.value): string {
+  return `${hostId}:${name}`
+}
+
 function select(name: string): void {
-  if (panelIds.value[name] === undefined) {
-    panelIds.value = nameMap(panelIds.value, { [name]: nextPanelId++ })
+  const key = panelKey(name)
+  if (panelIds.value[key] === undefined) {
+    panelIds.value = nameMap(panelIds.value, { [key]: nextPanelId++ })
   }
   selected.value = name
 }
 
 const selectedPanelId = computed(() =>
-  selected.value === null ? null : panelIds.value[selected.value] ?? null,
+  selected.value === null ? null : panelIds.value[panelKey(selected.value)] ?? null,
 )
 
 // Whether the selected session still exists server-side, from the same polled
@@ -159,6 +298,20 @@ function toggleFullscreen(): void {
 // warns first.
 const fileManagerOpen = ref(false)
 const filesDirty = ref(false)
+const dirtyHostIds = ref<string[]>([])
+const fileManagerRef = ref<{ discardHostDrafts: (id: string) => void } | null>(null)
+
+function onDirtyChange(d: boolean, hosts?: string[]) {
+  filesDirty.value = d
+  dirtyHostIds.value = hosts ?? []
+}
+
+function onHostDeleted(id: string) {
+  if (currentHostId.value === id) {
+    handleActiveHostRemoved(id)
+  }
+  void loadAvailableHosts(false)
+}
 
 // The hub publishes whether it offers a file manager at all. A button that
 // always answers "not found" invites a support question, so the entry point is
@@ -174,6 +327,7 @@ const filesAvailable = computed(() => getConfig().files.enabled)
 function closeFileManager(): void {
   fileManagerOpen.value = false
   filesDirty.value = false
+  dirtyHostIds.value = []
 }
 
 /** toggleFileManager warns before discarding unsaved edits.
@@ -200,8 +354,15 @@ function toggleFileManager(): void {
  * already quoted it and made sure it carries no line terminator; all that is left
  * is to find a live attachment, and to say so when there is none rather than
  * letting the insertion look like it worked. */
-function insertPathIntoTerminal(text: string): void {
-  if (selected.value === null || !insertIntoTerminal(selected.value, text)) {
+function insertPathIntoTerminal(text: string, sourceHostId = currentHostId.value): void {
+  if (!currentHostId.value || sourceHostId !== currentHostId.value) {
+    notify(
+      'warning',
+      `Cannot insert path across hosts: file belongs to ${sourceHostId} but active terminal is on ${currentHostId.value}.`,
+    )
+    return
+  }
+  if (selected.value === null || !insertIntoTerminal(selected.value, text, currentHostId.value)) {
     notify('warning', 'No live terminal to insert into.')
   }
 }
@@ -230,25 +391,38 @@ function closePanel(): void {
 const activity = shallowRef<Record<string, boolean>>(nameMap())
 const activityTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-function onActivity(name: string): void {
-  if (!activity.value[name]) {
-    activity.value = nameMap(activity.value, { [name]: true })
+function onActivity(name: string, hostId = currentHostId.value): void {
+  const key = panelKey(name, hostId)
+  if (!activity.value[key]) {
+    activity.value = nameMap(activity.value, { [key]: true })
   }
-  const timer = activityTimers.get(name)
+  const timer = activityTimers.get(key)
   if (timer) clearTimeout(timer)
   activityTimers.set(
-    name,
+    key,
     setTimeout(() => {
-      activityTimers.delete(name)
+      activityTimers.delete(key)
       const next = nameMap(activity.value)
-      delete next[name]
+      delete next[key]
       activity.value = next
     }, getConfig().web.activity_decay),
   )
 }
 
+const currentHostActivity = computed(() => {
+  const result = nameMap<boolean>()
+  if (!currentHostId.value) return result
+  const prefix = `${currentHostId.value}:`
+  for (const [key, val] of Object.entries(activity.value)) {
+    if (key.startsWith(prefix) && val) {
+      result[key.slice(prefix.length)] = true
+    }
+  }
+  return result
+})
+
 const selectedActive = computed(
-  () => selected.value !== null && !!activity.value[selected.value],
+  () => selected.value !== null && currentHostId.value !== null && !!activity.value[panelKey(selected.value, currentHostId.value)],
 )
 
 // The tab-title mark is the only signal visible when the browser tab itself
@@ -275,6 +449,7 @@ function toggleSidebar(): void {
 // --- In-app help ---
 
 const helpOpen = ref(false)
+const hostManagerOpen = ref(false)
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -293,47 +468,92 @@ function stopPolling() {
 let refreshSeq = 0
 
 async function refresh() {
-  if (!hasToken.value) return
+  if (!hasToken.value || !currentHostId.value || activeHostRemoved.value) return
   const seq = ++refreshSeq
+  const targetHostId = currentHostId.value
+  const targetConnectionRevision = currentHost.value?.connectionRevision
   try {
-    const list = await listSessions()
+    const list = await listSessions(targetHostId)
     if (seq !== refreshSeq) return
+    if (currentHostId.value !== targetHostId || activeHostRemoved.value) return
+    if (
+      targetConnectionRevision !== undefined &&
+      currentHost.value?.connectionRevision !== undefined &&
+      currentHost.value.connectionRevision !== targetConnectionRevision
+    ) {
+      // Stale response from a superseded host connection revision dropped
+      return
+    }
+    cachedSessionsByHost.value = nameMap(cachedSessionsByHost.value, {
+      [targetHostId]: list,
+    })
     sessions.value = list
     listError.value = ''
+    listStale.value = false
     startPolling()
 
     // Prune dead panels for sessions that disappeared externally (e.g. killed via CLI).
     const liveNames = new Set(list.map((s) => s.name))
-    const deadNames = new Set<string>()
-    for (const name of Object.keys(panelIds.value)) {
-      if (!liveNames.has(name) && selected.value !== name) deadNames.add(name)
+    const deadKeys = new Set<string>()
+    for (const key of Object.keys(panelIds.value)) {
+      const colon = key.indexOf(':')
+      const host = colon >= 0 ? key.slice(0, colon) : 'local'
+      const name = colon >= 0 ? key.slice(colon + 1) : key
+      if (host === targetHostId && !liveNames.has(name) && selected.value !== name) {
+        deadKeys.add(key)
+      }
     }
-    for (const name of Object.keys(connStates.value)) {
-      if (!liveNames.has(name) && selected.value !== name) deadNames.add(name)
-    }
-    for (const name of Object.keys(activity.value)) {
-      if (!liveNames.has(name) && selected.value !== name) deadNames.add(name)
-    }
-    for (const name of deadNames) {
-      dropPanel(name)
+    for (const key of deadKeys) {
+      const colon = key.indexOf(':')
+      const host = colon >= 0 ? key.slice(0, colon) : 'local'
+      const name = colon >= 0 ? key.slice(colon + 1) : key
+      dropPanel(name, host)
     }
   } catch (err) {
     if (seq !== refreshSeq) return
+    if (currentHostId.value !== targetHostId || activeHostRemoved.value) return
+    if (
+      targetConnectionRevision !== undefined &&
+      currentHost.value?.connectionRevision !== undefined &&
+      currentHost.value.connectionRevision !== targetConnectionRevision
+    ) {
+      return
+    }
+
     if (err instanceof AuthError) {
       handleAuthFailure()
-    } else {
-      listError.value = err instanceof Error ? err.message : String(err)
+      return
+    }
+
+    const msg = err instanceof Error ? err.message : String(err)
+    listError.value = msg
+    listStale.value = true
+
+    // Stop automatic polling on host-level failures to offer host repair
+    if (
+      msg.startsWith('host_unavailable') ||
+      msg.startsWith('host_not_found') ||
+      msg.startsWith('host_revision_conflict') ||
+      msg.includes('ssh authentication failed') ||
+      msg.includes('untrusted_host_key')
+    ) {
+      stopPolling()
     }
   }
 }
 
 function cleanupSessionState() {
-  for (const name of Object.keys(panelIds.value)) {
-    disposeTerminalSession(name)
+  for (const key of Object.keys(panelIds.value)) {
+    const colon = key.indexOf(':')
+    const host = colon >= 0 ? key.slice(0, colon) : 'local'
+    const name = colon >= 0 ? key.slice(colon + 1) : key
+    disposeTerminalSession(name, host)
   }
   panelIds.value = nameMap()
   connStates.value = nameMap()
   activity.value = nameMap()
+  cachedSessionsByHost.value = nameMap()
+  listStale.value = false
   for (const timer of activityTimers.values()) clearTimeout(timer)
   activityTimers.clear()
 }
@@ -342,6 +562,10 @@ function handleAuthFailure() {
   stopPolling()
   clearToken()
   token.value = ''
+  currentHostId.value = null
+  availableHosts.value = []
+  activeHostRemoved.value = false
+  hasInitializedWorkspace.value = false
   // The credential is gone, so nothing could be saved anyway; asking about
   // unsaved edits here would be a question with only one answer.
   closeFileManager()
@@ -369,14 +593,12 @@ async function submitToken() {
   authError.value = ''
   try {
     setToken(t)
-    const list = await listSessions()
     token.value = t
     tokenInput.value = ''
-    sessions.value = list
-    listError.value = ''
-    startPolling()
+    await loadAvailableHosts(true)
   } catch (err) {
     clearToken()
+    token.value = ''
     if (err instanceof AuthError) {
       authError.value = 'Authentication failed. Check the token and try again.'
     } else {
@@ -391,6 +613,10 @@ function logout() {
   stopPolling()
   clearToken()
   token.value = ''
+  currentHostId.value = null
+  availableHosts.value = []
+  activeHostRemoved.value = false
+  hasInitializedWorkspace.value = false
   // As with an auth failure: the token is gone, so there is nothing to ask.
   closeFileManager()
   selected.value = null
@@ -398,80 +624,154 @@ function logout() {
   cleanupSessionState()
 }
 
+function onHostChange(): void {
+  if (!currentHostId.value) return
+  activeHostRemoved.value = false
+  try {
+    localStorage.setItem(RECENT_HOST_KEY, currentHostId.value)
+  } catch {
+    /* ignore storage quota */
+  }
+  selected.value = null
+  listError.value = ''
+  listStale.value = false
+  sessions.value = cachedSessionsByHost.value[currentHostId.value] || []
+  void refresh()
+}
+
+function onSelectHostFromModal(id: string): void {
+  hostManagerOpen.value = false
+  if (currentHostId.value !== id || activeHostRemoved.value) {
+    selectHost(id)
+  }
+}
+
+function openHostManagerAdd(): void {
+  managerInitialHostId.value = null
+  hostManagerOpen.value = true
+}
+
 // One-click creation: the hub assigns the default name (made unique by its
 // suffix retry); renaming is how the user personalizes it afterwards.
 const creating = ref(false)
 async function onCreate() {
-  if (creating.value) return
+  if (creating.value || !currentHostId.value || activeHostRemoved.value) return
+  const targetHostId = currentHostId.value
+  const targetHostName = currentHostName.value
+  const targetConnectionRev = currentHost.value?.connectionRevision
   creating.value = true
   try {
-    const sess = await createSession()
-    await refresh()
-    select(sess.name)
+    const sess = await createSession(undefined, targetHostId, targetConnectionRev)
+    if (
+      currentHostId.value === targetHostId &&
+      currentHost.value?.connectionRevision === targetConnectionRev &&
+      !activeHostRemoved.value
+    ) {
+      await refresh()
+      if (
+        currentHostId.value === targetHostId &&
+        currentHost.value?.connectionRevision === targetConnectionRev &&
+        !activeHostRemoved.value
+      ) {
+        select(sess.name)
+      }
+    }
   } catch (err) {
     if (err instanceof AuthError) {
       handleAuthFailure()
       return
     }
-    notify('error', err instanceof Error ? err.message : String(err))
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.includes('host_revision_conflict')) {
+      notify('error', `Could not create session on ${targetHostName}: host configuration has changed.`)
+      return
+    }
+    if (msg.includes('outcome_unknown')) {
+      notify('warning', `Creation outcome uncertain on ${targetHostName}. Verify sessions before retrying.`)
+      return
+    }
+    notify('error', msg)
   } finally {
     creating.value = false
   }
 }
 
 async function onRename(oldName: string, newName: string) {
+  if (!currentHostId.value || activeHostRemoved.value) return
+  const targetHostId = currentHostId.value
+  const targetHostName = currentHostName.value
+  const targetConnectionRev = currentHost.value?.connectionRevision
   try {
-    await renameSession(oldName, newName)
-    // Carry the panel identity across the rename, so the live attachment for
-    // this session is reused rather than stranded in the KeepAlive cache under
-    // a name that no longer exists (see panelIds).
-    const id = panelIds.value[oldName]
-    if (id !== undefined) {
-      const next = nameMap(panelIds.value, { [newName]: id })
-      delete next[oldName]
-      panelIds.value = next
+    await renameSession(oldName, newName, targetHostId, targetConnectionRev)
+    if (
+      currentHostId.value === targetHostId &&
+      currentHost.value?.connectionRevision === targetConnectionRev &&
+      !activeHostRemoved.value
+    ) {
+      // Carry the panel identity across the rename, so the live attachment for
+      // this session is reused rather than stranded in the KeepAlive cache under
+      // a name that no longer exists (see panelIds).
+      const oldKey = panelKey(oldName, targetHostId)
+      const newKey = panelKey(newName, targetHostId)
+      const id = panelIds.value[oldKey]
+      if (id !== undefined) {
+        const next = nameMap(panelIds.value, { [newKey]: id })
+        delete next[oldKey]
+        panelIds.value = next
+      }
+      if (connStates.value[oldKey] !== undefined) {
+        const nextStates = nameMap(connStates.value, { [newKey]: connStates.value[oldKey] })
+        delete nextStates[oldKey]
+        connStates.value = nextStates
+      }
+      if (activity.value[oldKey] !== undefined) {
+        const nextAct = nameMap(activity.value, { [newKey]: activity.value[oldKey] })
+        delete nextAct[oldKey]
+        activity.value = nextAct
+      }
+      const timer = activityTimers.get(oldKey)
+      if (timer) {
+        clearTimeout(timer)
+        activityTimers.delete(oldKey)
+        activityTimers.set(
+          newKey,
+          setTimeout(() => {
+            activityTimers.delete(newKey)
+            const next = nameMap(activity.value)
+            delete next[newKey]
+            activity.value = next
+          }, getConfig().web.activity_decay),
+        )
+      }
+      // Follow the rename: `selected` is the viewed terminal's identity — it
+      // names the ws ticket and the header. Left on the old name, the polled
+      // list no longer contains it, so a live session reads as ended and every
+      // reconnect asks for a ticket the hub answers with session_not_found.
+      if (currentHostId.value === targetHostId && selected.value === oldName) {
+        selected.value = newName
+      }
+      // Retarget the attachment itself. For the viewed panel the `session` prop
+      // change would reach it, but a panel parked in the KeepAlive cache never
+      // re-renders, so no prop can: without this its terminal keeps the old name
+      // and its next reconnect asks the hub for a session that no longer exists.
+      renameTerminalSession(oldName, newName, targetHostId)
+      await refresh()
     }
-    if (connStates.value[oldName] !== undefined) {
-      const nextStates = nameMap(connStates.value, { [newName]: connStates.value[oldName] })
-      delete nextStates[oldName]
-      connStates.value = nextStates
-    }
-    if (activity.value[oldName] !== undefined) {
-      const nextAct = nameMap(activity.value, { [newName]: activity.value[oldName] })
-      delete nextAct[oldName]
-      activity.value = nextAct
-    }
-    const timer = activityTimers.get(oldName)
-    if (timer) {
-      clearTimeout(timer)
-      activityTimers.delete(oldName)
-      activityTimers.set(
-        newName,
-        setTimeout(() => {
-          activityTimers.delete(newName)
-          const next = nameMap(activity.value)
-          delete next[newName]
-          activity.value = next
-        }, getConfig().web.activity_decay),
-      )
-    }
-    // Follow the rename: `selected` is the viewed terminal's identity — it
-    // names the ws ticket and the header. Left on the old name, the polled
-    // list no longer contains it, so a live session reads as ended and every
-    // reconnect asks for a ticket the hub answers with session_not_found.
-    if (selected.value === oldName) selected.value = newName
-    // Retarget the attachment itself. For the viewed panel the `session` prop
-    // change would reach it, but a panel parked in the KeepAlive cache never
-    // re-renders, so no prop can: without this its terminal keeps the old name
-    // and its next reconnect asks the hub for a session that no longer exists.
-    renameTerminalSession(oldName, newName)
-    await refresh()
   } catch (err) {
     if (err instanceof AuthError) {
       handleAuthFailure()
       return
     }
-    notify('error', err instanceof Error ? err.message : String(err))
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.includes('host_revision_conflict')) {
+      notify('error', `Could not rename session on ${targetHostName}: host configuration has changed.`)
+      return
+    }
+    if (msg.includes('outcome_unknown')) {
+      notify('warning', `Rename outcome uncertain on ${targetHostName}. Verify session before retrying.`)
+      return
+    }
+    notify('error', msg)
   }
 }
 
@@ -482,58 +782,110 @@ async function onRename(oldName: string, newName: string) {
 // gone — KeepAlive only unmounts on eviction, and nothing evicts here — so its
 // terminal is disposed explicitly, or its xterm instance, scrollback and
 // ResizeObserver would be retained for the life of the page.
-function dropPanel(name: string): void {
-  if (panelIds.value[name] !== undefined) {
+function dropPanel(name: string, hostId = currentHostId.value ?? 'local'): void {
+  const key = panelKey(name, hostId)
+  if (panelIds.value[key] !== undefined) {
     const next = nameMap(panelIds.value)
-    delete next[name]
+    delete next[key]
     panelIds.value = next
   }
-  if (connStates.value[name] !== undefined) {
+  if (connStates.value[key] !== undefined) {
     const nextStates = nameMap(connStates.value)
-    delete nextStates[name]
+    delete nextStates[key]
     connStates.value = nextStates
   }
-  if (activity.value[name] !== undefined) {
+  if (activity.value[key] !== undefined) {
     const nextAct = nameMap(activity.value)
-    delete nextAct[name]
+    delete nextAct[key]
     activity.value = nextAct
   }
-  const timer = activityTimers.get(name)
+  const timer = activityTimers.get(key)
   if (timer) {
     clearTimeout(timer)
-    activityTimers.delete(name)
+    activityTimers.delete(key)
   }
-  disposeTerminalSession(name)
+  disposeTerminalSession(name, hostId)
 }
 
 async function onKill(name: string) {
+  if (!currentHostId.value || activeHostRemoved.value) return
+  const targetHostId = currentHostId.value
+  const targetHostName = currentHostName.value
+  const targetConnectionRev = currentHost.value?.connectionRevision
   try {
-    await killSession(name)
-    if (selected.value === name) selected.value = null
-    dropPanel(name)
-    await refresh()
+    await killSession(name, targetHostId, targetConnectionRev)
+    dropPanel(name, targetHostId)
+    if (
+      currentHostId.value === targetHostId &&
+      currentHost.value?.connectionRevision === targetConnectionRev &&
+      !activeHostRemoved.value
+    ) {
+      if (selected.value === name) {
+        selected.value = null
+      }
+      await refresh()
+    }
   } catch (err) {
     if (err instanceof AuthError) {
       handleAuthFailure()
       return
     }
-    notify('error', err instanceof Error ? err.message : String(err))
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.includes('host_revision_conflict')) {
+      notify('error', `Could not kill session on ${targetHostName}: host configuration has changed.`)
+      return
+    }
+    if (msg.includes('outcome_unknown')) {
+      notify('warning', `Kill outcome uncertain on ${targetHostName}. Verify session before retrying.`)
+      return
+    }
+    notify('error', msg)
   }
 }
 
 // Bulk kill issues one DELETE per session sequentially and names the sessions
 // that failed, so a mid-batch failure never hides behind the successes.
 async function onBulkKill(names: string[]) {
+  if (!currentHostId.value || activeHostRemoved.value) return
+  const targetHostId = currentHostId.value
+  const targetHostName = currentHostName.value
+  const targetConnectionRev = currentHost.value?.connectionRevision
   const failed: string[] = []
   for (const name of names) {
+    if (activeHostRemoved.value) return
+    const currentConnRev = availableHosts.value.find((h) => h.id === targetHostId)?.connectionRevision
+    if (
+      targetConnectionRev !== undefined &&
+      currentConnRev !== undefined &&
+      currentConnRev !== targetConnectionRev
+    ) {
+      notify('warning', `Host configuration changed during bulk kill. Remaining sessions were not killed.`)
+      break
+    }
     try {
-      await killSession(name)
-      if (selected.value === name) selected.value = null
-      dropPanel(name)
+      await killSession(name, targetHostId, targetConnectionRev)
+      if (
+        currentHostId.value === targetHostId &&
+        currentHost.value?.connectionRevision === targetConnectionRev &&
+        !activeHostRemoved.value
+      ) {
+        if (selected.value === name) {
+          selected.value = null
+        }
+      }
+      dropPanel(name, targetHostId)
     } catch (err) {
       if (err instanceof AuthError) {
         handleAuthFailure()
         return
+      }
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('host_revision_conflict')) {
+        notify('error', `Could not kill session "${name}" on ${targetHostName}: host configuration changed.`)
+        break
+      }
+      if (msg.includes('outcome_unknown')) {
+        notify('warning', `Kill outcome uncertain for "${name}" on ${targetHostName}.`)
       }
       failed.push(name)
     }
@@ -541,19 +893,26 @@ async function onBulkKill(names: string[]) {
   if (failed.length > 0) {
     notify('error', `Failed to kill: ${failed.join(', ')}`)
   }
-  await refresh()
+  if (
+    currentHostId.value === targetHostId &&
+    currentHost.value?.connectionRevision === targetConnectionRev &&
+    !activeHostRemoved.value
+  ) {
+    await refresh()
+  }
 }
 
-function onState(session: string, state: ConnState) {
-  connStates.value = nameMap(connStates.value, { [session]: state })
+function onState(session: string, state: ConnState, hostId = currentHostId.value ?? 'local') {
+  const key = panelKey(session, hostId)
+  connStates.value = nameMap(connStates.value, { [key]: state })
 }
 
-function onNotice(message: string, level: 'error' | 'warning' = 'error') {
+function onNotice(message: string, level: ToastLevel = 'error') {
   notify(level, message)
 }
 
 function onOnline() {
-  if (hasToken.value) {
+  if (hasToken.value && currentHostId.value) {
     void refresh()
   }
 }
@@ -562,8 +921,10 @@ function onOffline() {
   notify('warning', 'Network connection offline')
 }
 
-onMounted(() => {
-  if (hasToken.value) void refresh()
+onMounted(async () => {
+  if (hasToken.value) {
+    await loadAvailableHosts(true)
+  }
   window.addEventListener('online', onOnline)
   window.addEventListener('offline', onOffline)
 })
@@ -604,10 +965,62 @@ onBeforeUnmount(() => {
     <template v-else>
       <header class="app__bar">
         <span class="app__title">Visual Tmux Client</span>
-        <button class="app__logout" type="button" aria-label="Disconnect and clear credentials" @click="logout">Disconnect</button>
+        <div class="app__host-select-wrapper">
+          <label for="host-select" class="sr-only">Select Host</label>
+          <select
+            id="host-select"
+            v-model="currentHostId"
+            class="app__host-select"
+            aria-label="Target Host"
+            @change="onHostChange"
+          >
+            <option v-if="currentHostId === null" :value="null" disabled>Select Host…</option>
+            <option v-for="h in availableHosts" :key="h.id" :value="h.id">
+              {{ h.name || h.id }}{{ h.address ? ` (${h.address})` : '' }}
+            </option>
+          </select>
+        </div>
+        <div class="app__bar-actions">
+          <button class="app__bar-btn" type="button" aria-label="Manage remote hosts" @click="hostManagerOpen = true">Hosts</button>
+          <button class="app__logout" type="button" aria-label="Disconnect and clear credentials" @click="logout">Disconnect</button>
+        </div>
       </header>
 
-      <div class="app__body">
+      <div v-if="hostDiscoveryError && !hasInitializedWorkspace" class="app__discovery-state app__discovery-state--error" role="alert">
+        <p class="app__discovery-msg">{{ hostDiscoveryError }}</p>
+        <button class="app__discovery-btn" type="button" @click="loadAvailableHosts(true)">Retry</button>
+      </div>
+
+      <div v-else-if="!hostDiscoveryLoading && availableHosts.length === 0 && !activeHostRemoved && !hasInitializedWorkspace" class="app__discovery-state app__discovery-state--empty">
+        <p class="app__discovery-msg">No hosts registered. Add a host to get started.</p>
+        <button class="app__discovery-btn" type="button" @click="openHostManagerAdd">+ Add Host</button>
+      </div>
+
+      <div v-else-if="!currentHostId && !activeHostRemoved && !hasInitializedWorkspace" class="app__discovery-state app__discovery-state--prompt">
+        <h2 class="app__discovery-title">Select a Host</h2>
+        <p class="app__discovery-msg">Choose a host to manage tmux sessions:</p>
+        <div class="app__prompt-hosts">
+          <button
+            v-for="h in availableHosts"
+            :key="h.id"
+            class="app__host-card-btn"
+            type="button"
+            @click="selectHost(h.id)"
+          >
+            <span class="app__host-card-name">{{ h.name || h.id }}</span>
+            <span v-if="h.address" class="app__host-card-addr">{{ h.address }}</span>
+          </button>
+        </div>
+      </div>
+
+      <div v-else class="app__body">
+        <div v-if="hostDiscoveryError" class="app__discovery-state app__discovery-state--error app__discovery-banner" role="alert">
+          <p class="app__discovery-msg">{{ hostDiscoveryError }}</p>
+          <button class="app__discovery-btn" type="button" @click="loadAvailableHosts(false)">Retry</button>
+        </div>
+        <div v-if="activeHostRemoved" class="app__removed-banner" role="alert">
+          {{ availableHosts.length === 0 ? 'Active host was removed. Input and operations are stopped. Add a host to continue.' : 'Active host was removed. Input and operations are stopped. Select another host to continue.' }}
+        </div>
         <aside class="app__sidebar" :class="{ 'app__sidebar--collapsed': sidebarCollapsed }">
           <template v-if="!sidebarCollapsed">
             <button
@@ -622,15 +1035,19 @@ onBeforeUnmount(() => {
               <SessionList
                 :sessions="sessions"
                 :error="listError"
+                :stale="listStale"
                 :selected="selected"
-                :active="activity"
+                :active="currentHostActivity"
                 :creating="creating"
+                :host-id="currentHostId ?? undefined"
+                :host-name="currentHostName"
                 @select="select($event)"
                 @create="onCreate"
                 @rename="onRename"
                 @kill="onKill"
                 @bulk-kill="onBulkKill"
                 @retry="refresh"
+                @repair="openHostManagerFor(currentHostId)"
               />
             </div>
             <button class="app__help-btn" type="button" title="tmux 使用指南" @click="helpOpen = true">
@@ -663,13 +1080,14 @@ onBeforeUnmount(() => {
               :title="selectedActive ? 'producing output' : 'idle'"
               aria-hidden="true"
             ></span>
+            <span class="app__term-host" :title="`Host: ${currentHostName} (${currentHostId})`">{{ currentHostName }}</span>
             <span class="app__term-title">{{ selected }}</span>
             <span
               class="app__term-state"
-              :class="`app__term-state--${connStates[selected] ?? 'connecting'}`"
+              :class="`app__term-state--${connStates[panelKey(selected)] ?? 'connecting'}`"
               role="status"
               aria-live="polite"
-            >{{ connStates[selected] ?? 'connecting' }}</span>
+            >{{ connStates[panelKey(selected)] ?? 'connecting' }}</span>
             <span class="app__term-spacer"></span>
             <button
               class="app__term-btn"
@@ -720,6 +1138,7 @@ onBeforeUnmount(() => {
               :session="selected"
               :alive="selectedAlive"
               :font-size="fontSize"
+              :host-id="currentHostId ?? undefined"
               @state="onState"
               @notice="onNotice"
               @activity="onActivity"
@@ -727,11 +1146,17 @@ onBeforeUnmount(() => {
           </KeepAlive>
           <div v-if="fileManagerOpen" class="app__files">
             <FileManagerOverlay
+              ref="fileManagerRef"
               :session="selected"
+              :host-id="currentHostId ?? undefined"
+              :host-name="currentHostName"
+              :host-revision="currentHostRevision"
+              :available-host-ids="availableHosts.map((h) => h.id)"
+              :available-hosts="availableHosts"
               @close="closeFileManager"
               @notice="onNotice"
               @insert-path="insertPathIntoTerminal"
-              @dirty-change="filesDirty = $event"
+              @dirty-change="onDirtyChange"
             />
           </div>
           <ToastStack />
@@ -740,6 +1165,15 @@ onBeforeUnmount(() => {
     </template>
 
     <HelpModal :open="helpOpen" @close="helpOpen = false" />
+    <HostManagerModal
+      :open="hostManagerOpen"
+      :initial-host-id="managerInitialHostId"
+      :dirty-hosts="dirtyHostIds"
+      @close="hostManagerOpen = false; managerInitialHostId = null"
+      @hosts-changed="loadAvailableHosts"
+      @host-deleted="onHostDeleted"
+      @select-host="onSelectHostFromModal"
+    />
   </div>
 </template>
 
@@ -768,8 +1202,42 @@ onBeforeUnmount(() => {
   font-weight: 600;
   font-size: 0.95rem;
 }
-.app__logout {
+.app__host-select-wrapper {
+  display: flex;
+  align-items: center;
+}
+.app__host-select {
+  background: var(--th-raised);
+  color: var(--th-text-hi);
+  border: 1px solid var(--th-border);
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.app__host-select:focus {
+  border-color: var(--th-focus);
+  outline: none;
+}
+.app__bar-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.app__bar-btn {
+  background: var(--th-raised);
+  color: var(--th-text-hi);
+  border: 1px solid var(--th-border);
+  border-radius: 4px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.app__bar-btn:hover {
+  border-color: var(--th-text-lo);
+}
+.app__logout {
   background: var(--th-raised);
   color: var(--th-text-hi);
   border: 1px solid var(--th-border);
@@ -822,6 +1290,16 @@ onBeforeUnmount(() => {
   .app__sidebar {
     transition: none;
   }
+}
+.app__term-host {
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.15rem 0.4rem;
+  background: var(--th-raised);
+  color: var(--th-text-lo);
+  border: 1px solid var(--th-border);
+  border-radius: 3px;
+  white-space: nowrap;
 }
 .app__term-title {
   font-family: var(--app-code-font);
@@ -1033,5 +1511,93 @@ onBeforeUnmount(() => {
   margin: 0;
   color: var(--th-danger);
   font-size: 0.8rem;
+}
+.app__discovery-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: 2rem;
+  text-align: center;
+}
+.app__discovery-title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--th-text-hi);
+}
+.app__discovery-msg {
+  margin: 0;
+  color: var(--th-text-lo);
+  font-size: 0.95rem;
+  max-width: 480px;
+}
+.app__discovery-state--error .app__discovery-msg {
+  color: var(--th-danger);
+}
+.app__discovery-btn {
+  background: var(--th-raised);
+  color: var(--th-text-hi);
+  border: 1px solid var(--th-border);
+  border-radius: 4px;
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.app__discovery-btn:hover {
+  border-color: var(--th-text-lo);
+}
+.app__prompt-hosts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: center;
+  max-width: 500px;
+}
+.app__host-card-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  background: var(--th-surface);
+  border: 1px solid var(--th-border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  min-width: 140px;
+  text-align: left;
+}
+.app__host-card-btn:hover {
+  border-color: var(--th-focus);
+  background: var(--th-raised);
+}
+.app__host-card-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--th-text-hi);
+}
+.app__host-card-addr {
+  font-size: 0.75rem;
+  color: var(--th-text-lo);
+}
+.app__removed-banner {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--th-danger);
+  border-bottom: 1px solid var(--th-danger);
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  text-align: center;
+  font-weight: 500;
+}
+.app__discovery-banner {
+  flex: none;
+  padding: 0.5rem 1rem;
+  flex-direction: row;
+  justify-content: center;
+  gap: 1rem;
+  background: rgba(239, 68, 68, 0.15);
+  border-bottom: 1px solid var(--th-danger);
 }
 </style>

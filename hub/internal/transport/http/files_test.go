@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/AK12-Official/visual-tmux-client/hub/internal/files"
+	"github.com/AK12-Official/visual-tmux-client/hub/internal/host"
 	"github.com/AK12-Official/visual-tmux-client/hub/internal/session"
 )
 
@@ -854,5 +859,501 @@ func TestReadRouteServesAShortenedFileAtItsNewLength(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-File-Size"); got != "4" {
 		t.Errorf("expected X-File-Size 4, got %q", got)
+	}
+}
+
+type mockResolver struct {
+	resolveFn func(ctx context.Context, id host.ID) (host.Runtime, error)
+	calls     []host.ID
+}
+
+func (m *mockResolver) Resolve(ctx context.Context, id host.ID) (host.Runtime, error) {
+	m.calls = append(m.calls, id)
+	if m.resolveFn != nil {
+		return m.resolveFn(ctx, id)
+	}
+	return host.Runtime{}, host.ErrNotFound
+}
+
+func TestHostScopedRemoteFileRoutesAndGlobalDisablement(t *testing.T) {
+	remoteFiles := &mockFileService{
+		listFn: func(p string) (files.ListResult, error) {
+			return files.ListResult{Path: p}, nil
+		},
+		readFn: func(p string) (files.ReadResult, error) {
+			return openReadResult(t, "remote content"), nil
+		},
+		writeFn: func(
+			p string, body io.Reader, size int64, mtime *files.ExpectedMtime, allowOtherNames bool,
+		) (files.WriteResult, error) {
+			if strings.Contains(p, "uncertain") {
+				return files.WriteResult{}, &host.Error{Target: host.Target{HostID: "r1"}, Code: host.ErrOutcomeUnknown}
+			}
+			if strings.Contains(p, "offline") {
+				return files.WriteResult{}, &host.Error{Target: host.Target{HostID: "r1"}, Code: host.ErrUnavailable}
+			}
+			return files.WriteResult{Mtime: 123456, MtimeNanos: 123456000000}, nil
+		},
+		createFn: func(p string, isDir bool) error { return nil },
+		renameFn: func(p, np string) error { return nil },
+		deleteFn: func(p string, rec bool) error { return nil },
+	}
+
+	remoteHostID := host.ID("remote-box")
+	resolver := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			if id == remoteHostID {
+				return host.Runtime{
+					Target:   host.Target{HostID: remoteHostID, Revision: 1},
+					Sessions: &mockSessionService{},
+					Files:    remoteFiles,
+				}, nil
+			}
+			return host.Runtime{}, host.ErrNotFound
+		},
+	}
+
+	cfg := testRouterConfig("tok", nil)
+	cfg.FilesEnabled = true
+	router := NewRouterWithResolver(cfg, resolver, &mockTicketIssuer{}, nil)
+
+	// 1. Verify remote file operations route to remoteFiles
+	rec := authedGet(t, router, "/api/hosts/remote-box/files/list?path=/home/user")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for remote list, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authedGet(t, router, "/api/hosts/remote-box/files/read?path=/home/user/file.txt")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for remote read, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	writeURL := "/api/hosts/remote-box/files/write?path=/home/user/file.txt&size=4&allow_other_names=1"
+	rec = authedPut(t, router, writeURL, "data")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for remote write, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Verify typed host errors mapped accurately
+	// ErrOutcomeUnknown -> 502 Bad Gateway
+	uncertainURL := "/api/hosts/remote-box/files/write?path=/home/user/uncertain.txt&size=4&allow_other_names=1"
+	rec = authedPut(t, router, uncertainURL, "data")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for outcome_unknown, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "outcome_unknown") {
+		t.Fatalf("expected outcome_unknown error envelope, got: %s", rec.Body.String())
+	}
+
+	// ErrUnavailable -> 503 Service Unavailable
+	offlineURL := "/api/hosts/remote-box/files/write?path=/home/user/offline.txt&size=4&allow_other_names=1"
+	rec = authedPut(t, router, offlineURL, "data")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for host_unavailable, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Unknown host -> 404 host_not_found
+	rec = authedGet(t, router, "/api/hosts/nonexistent/files/list?path=/home")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown host, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "host_not_found") {
+		t.Fatalf("expected host_not_found error envelope, got: %s", rec.Body.String())
+	}
+
+	// 3. Global Disablement: FilesEnabled = false
+	disabledCfg := testRouterConfig("tok", nil)
+	disabledCfg.FilesEnabled = false
+
+	noTouchResolver := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			t.Fatalf("Resolver.Resolve MUST NOT be called when files are globally disabled, called with id: %s", id)
+			return host.Runtime{}, nil
+		},
+	}
+	disabledRouter := NewRouterWithResolver(disabledCfg, noTouchResolver, &mockTicketIssuer{}, nil)
+
+	routesToTest := []struct {
+		method string
+		target string
+		body   string
+	}{
+		{http.MethodGet, "/api/hosts/local/files/list?path=/tmp", ""},
+		{http.MethodGet, "/api/hosts/local/files/read?path=/tmp/a", ""},
+		{http.MethodGet, "/api/hosts/local/files/download?path=/tmp/a", ""},
+		{http.MethodPut, "/api/hosts/local/files/write?path=/tmp/a&size=1", "x"},
+		{http.MethodPost, "/api/hosts/local/files/create", `{"path":"/tmp/a","kind":"file"}`},
+		{http.MethodPost, "/api/hosts/local/files/rename", `{"path":"/tmp/a","new_path":"/tmp/b"}`},
+		{http.MethodPost, "/api/hosts/local/files/delete", `{"path":"/tmp/a"}`},
+		{http.MethodGet, "/api/hosts/local/sessions/sess1/working-directory", ""},
+		{http.MethodGet, "/api/hosts/remote-box/files/list?path=/remote", ""},
+		{http.MethodGet, "/api/hosts/remote-box/files/read?path=/remote/a", ""},
+		{http.MethodGet, "/api/hosts/remote-box/files/download?path=/remote/a", ""},
+		{http.MethodPut, "/api/hosts/remote-box/files/write?path=/remote/a&size=1", "x"},
+		{http.MethodPost, "/api/hosts/remote-box/files/create", `{"path":"/remote/a","kind":"file"}`},
+		{http.MethodPost, "/api/hosts/remote-box/files/rename", `{"path":"/remote/a","new_path":"/remote/b"}`},
+		{http.MethodPost, "/api/hosts/remote-box/files/delete", `{"path":"/remote/a"}`},
+		{http.MethodGet, "/api/hosts/remote-box/sessions/sess1/working-directory", ""},
+	}
+
+	for _, route := range routesToTest {
+		t.Run(route.method+"_"+route.target, func(t *testing.T) {
+			resp := authedRequest(t, disabledRouter, route.method, route.target, route.body)
+			if resp.Code != http.StatusNotFound {
+				t.Fatalf("expected 404 for disabled files on %s %s, got %d: %s",
+					route.method, route.target, resp.Code, resp.Body.String())
+			}
+			if !strings.Contains(resp.Body.String(), "not_found") {
+				t.Fatalf("expected not_found error envelope, got: %s", resp.Body.String())
+			}
+		})
+	}
+
+	// Verify no calls reached the resolver
+	if len(noTouchResolver.calls) != 0 {
+		t.Fatalf("expected 0 resolver calls when files are globally disabled, got: %v", noTouchResolver.calls)
+	}
+}
+
+func TestFilesWriteExpectedConnectionRevisionConflict(t *testing.T) {
+	fs := &mockFileService{}
+	r := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			return host.Runtime{
+				Target: host.Target{HostID: "remote-box", Revision: 5, ConnectionRevision: 3},
+				Files:  fs,
+			}, nil
+		},
+	}
+	router := NewRouterWithResolver(testRouterConfig("tok", nil), r, &mockTicketIssuer{}, nil)
+
+	// Matching revision succeeds
+	matchURL := "/api/hosts/remote-box/files/write?path=/work/a.txt&size=4&expected_connection_revision=3"
+	rec1 := authedRequest(t, router, http.MethodPut, matchURL, "data")
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 for matching connection revision, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	// Mismatched revision returns 409 Conflict
+	mismatchURL := "/api/hosts/remote-box/files/write?path=/work/a.txt&size=4&expected_connection_revision=2"
+	rec2 := authedRequest(t, router, http.MethodPut, mismatchURL, "data")
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for mismatched connection revision, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "host_revision_conflict") {
+		t.Fatalf("expected host_revision_conflict in error response, got: %s", rec2.Body.String())
+	}
+}
+
+func TestFilesWriteBodyCancellation(t *testing.T) {
+	pipeR, pipeW := io.Pipe()
+
+	fs := &mockFileService{
+		writeFn: func(
+			path string, body io.Reader, size int64, mtime *files.ExpectedMtime, allowOtherNames bool,
+		) (files.WriteResult, error) {
+			buf := make([]byte, 10)
+			_, err := io.ReadFull(body, buf)
+			if err != nil {
+				return files.WriteResult{}, err
+			}
+			// Wait for cancel
+			_, err = io.ReadAll(body)
+			return files.WriteResult{}, err
+		},
+	}
+	r := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			return host.Runtime{
+				Target: host.Target{HostID: "remote-box", Revision: 1, ConnectionRevision: 1},
+				Files:  fs,
+			}, nil
+		},
+	}
+	router := NewRouterWithResolver(testRouterConfig("tok", nil), r, &mockTicketIssuer{}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	writeURL := "/api/hosts/remote-box/files/write?path=/work/a.txt&size=100"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, writeURL, pipeR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok")
+
+	done := make(chan struct{})
+	rec := httptest.NewRecorder()
+	go func() {
+		router.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	// Send partial 10 bytes then stop
+	_, _ = pipeW.Write([]byte("0123456789")) //nolint:errcheck // partial test body write
+
+	// Cancel context to simulate timeout / client abort
+	cancel()
+
+	select {
+	case <-done:
+		// Succeeded in returning promptly upon cancellation
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("handler hung ignoring body read cancellation")
+	}
+	_ = pipeW.Close() //nolint:errcheck // test cleanup
+}
+
+func TestFilesMutateExpectedConnectionRevisionConflict(t *testing.T) {
+	fs := &mockFileService{}
+	r := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			return host.Runtime{
+				Target: host.Target{HostID: "remote-box", Revision: 5, ConnectionRevision: 3},
+				Files:  fs,
+			}, nil
+		},
+	}
+	router := NewRouterWithResolver(testRouterConfig("tok", nil), r, &mockTicketIssuer{}, nil)
+
+	// 1. Create entry
+	matchCreate := `{"path":"/work/file.txt","kind":"file","expected_connection_revision":3}`
+	rec := authedRequest(t, router, http.MethodPost, "/api/hosts/remote-box/files/create", matchCreate)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for matching create, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	mismatchCreate := `{"path":"/work/file.txt","kind":"file","expected_connection_revision":2}`
+	rec = authedRequest(t, router, http.MethodPost, "/api/hosts/remote-box/files/create", mismatchCreate)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "host_revision_conflict") {
+		t.Fatalf("expected 409 host_revision_conflict for mismatched create, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Rename entry
+	matchRename := `{"path":"/work/file.txt","new_path":"/work/file2.txt","expected_connection_revision":3}`
+	rec = authedRequest(t, router, http.MethodPost, "/api/hosts/remote-box/files/rename", matchRename)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for matching rename, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	mismatchRename := `{"path":"/work/file.txt","new_path":"/work/file2.txt","expected_connection_revision":2}`
+	rec = authedRequest(t, router, http.MethodPost, "/api/hosts/remote-box/files/rename", mismatchRename)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "host_revision_conflict") {
+		t.Fatalf("expected 409 host_revision_conflict for mismatched rename, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 3. Delete entry
+	matchDelete := `{"path":"/work/file2.txt","recursive":false,"expected_connection_revision":3}`
+	rec = authedRequest(t, router, http.MethodPost, "/api/hosts/remote-box/files/delete", matchDelete)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for matching delete, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	mismatchDelete := `{"path":"/work/file2.txt","recursive":false,"expected_connection_revision":2}`
+	rec = authedRequest(t, router, http.MethodPost, "/api/hosts/remote-box/files/delete", mismatchDelete)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "host_revision_conflict") {
+		t.Fatalf("expected 409 host_revision_conflict for mismatched delete, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFilesWriteSlowBodyTimeout(t *testing.T) {
+	bodyReadBlocked := make(chan struct{})
+	unblocked := make(chan struct{})
+
+	fs := &mockFileService{
+		writeFn: func(
+			path string, body io.Reader, size int64, mtime *files.ExpectedMtime, allowOtherNames bool,
+		) (files.WriteResult, error) {
+			buf := make([]byte, 10)
+			_, err := io.ReadFull(body, buf)
+			if err != nil {
+				return files.WriteResult{}, err
+			}
+			close(bodyReadBlocked)
+			// Read remaining body (blocks until SetReadDeadline interrupts it)
+			_, err = io.ReadAll(body)
+			close(unblocked)
+			return files.WriteResult{}, err
+		},
+	}
+	r := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			return host.Runtime{
+				Target: host.Target{HostID: "remote-box", Revision: 1, ConnectionRevision: 1},
+				Files:  fs,
+			}, nil
+		},
+	}
+
+	cfg := testRouterConfig("tok", nil)
+	cfg.FileOperationTimeout = 100 * time.Millisecond
+	router := NewRouterWithResolver(cfg, r, &mockTicketIssuer{}, nil)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	// Connect with real TCP socket
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck // cleanup
+
+	reqHeaders := "PUT /api/hosts/remote-box/files/write?path=/work/slow.txt&size=1000 HTTP/1.1\r\n" +
+		"Host: " + server.Listener.Addr().String() + "\r\n" +
+		"Authorization: Bearer tok\r\n" +
+		"Content-Length: 1000\r\n" +
+		"Connection: close\r\n\r\n" +
+		"0123456789" // only 10 of 1000 bytes sent!
+
+	if _, err := conn.Write([]byte(reqHeaders)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until handler reads the first 10 bytes and starts blocking on the rest
+	select {
+	case <-bodyReadBlocked:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start reading body")
+	}
+
+	// Now wait for FileOperationTimeout (100ms) to trigger SetReadDeadline and unblock io.ReadAll
+	select {
+	case <-unblocked:
+		// Succeeded in unblocking!
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("handler hung on stalled TCP body read exceeding FileOperationTimeout")
+	}
+}
+
+type spyDeadlineWriter struct {
+	http.ResponseWriter
+	mu            sync.Mutex
+	deadlineCalls int
+}
+
+func (s *spyDeadlineWriter) SetReadDeadline(t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deadlineCalls++
+	return nil
+}
+
+func (s *spyDeadlineWriter) getCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deadlineCalls
+}
+
+func TestFilesWriteWatcherNeverUsesWriterAfterReturn(t *testing.T) {
+	fs := &mockFileService{
+		writeFn: func(
+			path string, body io.Reader, size int64, mtime *files.ExpectedMtime, allowOtherNames bool,
+		) (files.WriteResult, error) {
+			_, err := io.Copy(io.Discard, body)
+			return files.WriteResult{Mtime: 123456, MtimeNanos: 123456000}, err
+		},
+	}
+	r := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			return host.Runtime{
+				Target: host.Target{HostID: "remote-box", Revision: 1, ConnectionRevision: 1},
+				Files:  fs,
+			}, nil
+		},
+	}
+
+	cfg := testRouterConfig("tok", nil)
+	router := NewRouterWithResolver(cfg, r, &mockTicketIssuer{}, nil)
+
+	for i := range 100 {
+		rec := httptest.NewRecorder()
+		spy := &spyDeadlineWriter{ResponseWriter: rec}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/api/hosts/remote-box/files/write?path=/work/f.txt&size=5",
+			strings.NewReader("hello"),
+		)
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Content-Type", "application/octet-stream")
+
+		router.ServeHTTP(spy, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("run %d: status = %d, want 200", i, rec.Code)
+		}
+
+		time.Sleep(time.Millisecond)
+
+		if calls := spy.getCalls(); calls != 0 {
+			t.Fatalf("run %d: SetReadDeadline was invoked %d times on normal write completion", i, calls)
+		}
+	}
+}
+
+func TestFilesWriteKeepAliveSequentialRequests(t *testing.T) {
+	fs := &mockFileService{
+		writeFn: func(
+			path string, body io.Reader, size int64, mtime *files.ExpectedMtime, allowOtherNames bool,
+		) (files.WriteResult, error) {
+			_, err := io.Copy(io.Discard, body)
+			return files.WriteResult{Mtime: 123456, MtimeNanos: 123456000}, err
+		},
+	}
+	r := &mockResolver{
+		resolveFn: func(ctx context.Context, id host.ID) (host.Runtime, error) {
+			return host.Runtime{
+				Target: host.Target{HostID: "remote-box", Revision: 1, ConnectionRevision: 1},
+				Files:  fs,
+			}, nil
+		},
+	}
+
+	cfg := testRouterConfig("tok", nil)
+	router := NewRouterWithResolver(cfg, r, &mockTicketIssuer{}, nil)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DisableKeepAlives:   false,
+			MaxIdleConnsPerHost: 1,
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	for i := range 10 {
+		req, err := http.NewRequest(
+			http.MethodPut,
+			server.URL+"/api/hosts/remote-box/files/write?path=/work/f.txt&size=5",
+			strings.NewReader("hello"),
+		)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Content-Type", "application/octet-stream")
+
+		var reused bool
+		trace := &httptrace.ClientTrace{
+			GotConn: func(connInfo httptrace.GotConnInfo) {
+				reused = connInfo.Reused
+			},
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %d failed on keep-alive connection: %v", i, err)
+		}
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			_ = resp.Body.Close() //nolint:errcheck // test cleanup
+			t.Fatalf("request %d: failed to drain response body: %v", i, err)
+		}
+		_ = resp.Body.Close() //nolint:errcheck // test cleanup
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: got status %d, want 200", i, resp.StatusCode)
+		}
+		if i > 0 && !reused {
+			t.Fatalf("request %d: connection was not reused across keep-alive requests", i)
+		}
 	}
 }

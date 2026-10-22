@@ -147,6 +147,19 @@ func (s *Service) Enabled() bool {
 	return s.enabled
 }
 
+// Boundary returns the confinement boundary: "root_confined" if explicit roots are configured, or "account_bound".
+func (s *Service) Boundary() string {
+	if s.roots != nil && s.roots.HasRoots() {
+		return "root_confined"
+	}
+	return "account_bound"
+}
+
+// RootHandleConfinement returns true if operations are confined through open root descriptors.
+func (s *Service) RootHandleConfinement() bool {
+	return s.roots != nil && s.roots.HasRoots()
+}
+
 // Close gives back the descriptors the configured roots are held through.
 //
 // A hub holds one per root for its lifetime, so this is the end of that
@@ -272,6 +285,11 @@ func compareEntries(a, b Entry) int {
 		return 1
 	}
 	return cmp.Compare(a.Name, b.Name)
+}
+
+// CompareEntries orders entries: directories first, then by name.
+func CompareEntries(a, b Entry) int {
+	return compareEntries(a, b)
 }
 
 // readListing reads a directory until one entry past the listing bound has been
@@ -454,6 +472,11 @@ const scanChunk = 32 * 1024
 //
 // Reading uses ReadAt, which does not move the file offset, so the caller still
 // streams the whole file from the beginning.
+// LooksBinary reports whether a file's contents are not text.
+func LooksBinary(ctx context.Context, file *os.File, size int64) (bool, error) {
+	return looksBinary(ctx, file, size)
+}
+
 func looksBinary(ctx context.Context, file *os.File, size int64) (bool, error) {
 	if size == 0 {
 		return false, nil
